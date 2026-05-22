@@ -1,0 +1,6 @@
+[submodule "lerobot"]
+	path = lerobot
+	url = https://github.com/huggingface/lerobot.git
+[submodule "XLeRobot"]
+	path = XLeRobot
+	url = https://github.com/Vector-Wangel/XLeRobot/
