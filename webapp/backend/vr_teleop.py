@@ -65,12 +65,9 @@ LOOP_HZ = 30.0
 LOOP_PERIOD_S = 1.0 / LOOP_HZ
 
 GOAL_SKIP_AGE_S = 0.30     # skip motor write if VR goal older than this
-# KP=1.0 = direct command (write the clamped target as-is). Lower values smooth
-# motor commands at the cost of input lag — useful when motor PID is soft, but
-# with `motors._stiffen_motor_pid` bumping P to 24, the servo's own PID is
-# stiff enough to handle the per-tick step without overshoot. Drop the
-# software smoothing to remove its lag contribution.
-KP = 1.0
+# Moderate software P-control matches the smoother xuweiwu dual-arm reference.
+# It damps residual IK/servo noise after the target filters below.
+KP = 0.75
 
 # Per-tick caps. At LOOP_HZ=30 these are effectively doubled in deg/sec vs the
 # old 15 Hz tuning, putting max joint speeds in the natural-hand-motion range:
@@ -79,25 +76,20 @@ KP = 1.0
 #   elbow_flex 3°/tick × 30Hz = 90°/s
 #   wrist 4°/tick × 30Hz = 120°/s
 PER_TICK_DEG_CAPS: dict[str, float] = {
-    # With URDF IK in the pipeline, the EE_DELTA_LIMIT_M cap upstream already
-    # bounds motion in EE space. The per-tick joint cap is now mainly a guard
-    # against IK divergence (paired with the explicit "30° jump" sanity check).
-    # Old tight values (3-6°) were throttling legitimate IK output, making
-    # the robot lag the hand. Loosened.
-    "shoulder_pan":  10.0,   # 300°/s ceiling — IK rarely needs more than ~120°/s
-    "shoulder_lift": 8.0,    # 240°/s (still slightly tighter — gravity-loaded)
-    "elbow_flex":    10.0,   # 300°/s
-    "wrist_flex":    12.0,   # 360°/s
-    "wrist_roll":    12.0,   # 360°/s
+    # At 30 Hz: 5°/tick = 150°/s, 6°/tick = 180°/s. These are deliberately
+    # below the recent 8-12° caps but still responsive enough for hand teleop.
+    "shoulder_pan":  5.0,
+    "shoulder_lift": 5.0,
+    "elbow_flex":    5.0,
+    "wrist_flex":    6.0,
+    "wrist_roll":    6.0,
     "gripper":       15.0,   # ~0.25s open/close
 }
 
-# Per-frame VR delta caps BEFORE the joint clamp. At scale=1.0, ee_cap=20mm/tick
-# × 30Hz = 60 cm/s EE speed — matches natural hand sweep. URDF IK keeps motion
-# continuous near singularities; we don't need a tight cap to mask analytical
-# IK discontinuities anymore.
-EE_DELTA_LIMIT_M = 0.020
-WRIST_RAD_DELTA_LIMIT = math.radians(15)
+# Per-frame VR delta caps BEFORE the joint clamp. At scale=1.0, 6 mm/tick ×
+# 30 Hz = 18 cm/s EE speed, between the reference's 3 mm and the recent 20 mm.
+EE_DELTA_LIMIT_M = 0.006
+WRIST_RAD_DELTA_LIMIT = math.radians(5)
 
 # Mapping from VR controller frame to robot base frame (upstream's convention,
 # upstream/xuweiwu's 8_vr_teleop_with_dataset_recording_dualarm.py lines 327–330):
@@ -142,10 +134,10 @@ RECORD_BUTTON_BY_SIDE: dict[str, str] = {"right": "B"}
 CALIBRATION_MIN_MOTION_M: float = 0.05    # 5 cm
 CALIBRATION_TARGET_MOTION_M: float = 0.10  # the wizard says "move ~10 cm"
 
-# Smoothing on incoming controller rotation (EMA). 1.0 = no smoothing,
-# 0.0 = frozen. 0.6 kills high-freq noise without adding visible lag.
-# Loaded from config/xlerobot.yaml's `vr.rotvec_ema_alpha` if present.
-ROTVEC_EMA_ALPHA: float = 0.6
+# Smoothing factors. 1.0 = raw input, 0.0 = frozen.
+POS_EMA_ALPHA: float = 0.5
+ORI_EMA_ALPHA: float = 0.4
+JOINT_EMA_ALPHA: float = 0.2
 
 
 # Homing: per-joint tolerance (degrees) to declare "arrived". 1.5° on
@@ -274,7 +266,7 @@ ROTVEC_DEADBAND_RAD = math.radians(0.3)  # 0.3° per tick
 # SO101 reach. Used to clamp the running EE target inside the actual workspace —
 # placo's solver is unstable when target is outside the reach envelope (it returns
 # different local minima per tick → jitter).
-WORKSPACE_REACH_M = 0.50         # URDF arm reach; IK does the actual soft-cap inside
+WORKSPACE_REACH_M = 0.45         # stay inside URDF reach to avoid IK edge flips
 
 
 def _load_urdf_kinematics():
@@ -309,6 +301,39 @@ import numpy as _np
 _VR_TO_ROBOT = _np.array([[0, 0, -1],
                           [-1, 0, 0],
                           [0, 1, 0]], dtype=float)
+
+
+def _slerp_rotation_matrix(
+    previous: _np.ndarray,
+    target: _np.ndarray,
+    alpha: float,
+    max_step_rad: float | None = None,
+) -> _np.ndarray:
+    """EMA-style smoothing for rotation matrices using shortest-path SLERP."""
+    if alpha <= 0.0:
+        return previous.copy()
+    if alpha >= 1.0 and max_step_rad is None:
+        return target.copy()
+    from scipy.spatial.transform import Rotation as _R, Slerp as _Slerp
+
+    prev_r = _R.from_matrix(previous)
+    target_r = _R.from_matrix(target)
+    candidate = _Slerp([0.0, 1.0], _R.concatenate([prev_r, target_r]))([alpha])[0]
+
+    if max_step_rad is not None:
+        step_angle = float((candidate * prev_r.inv()).magnitude())
+        if step_angle > max_step_rad > 0.0:
+            capped_alpha = max_step_rad / step_angle
+            candidate = _Slerp([0.0, 1.0], _R.concatenate([prev_r, candidate]))([capped_alpha])[0]
+    return candidate.as_matrix()
+
+
+def _clamp_to_workspace_reach(position: _np.ndarray) -> _np.ndarray:
+    """Keep the requested EE target inside the robot-base reach sphere."""
+    radius = float(_np.linalg.norm(position))
+    if radius <= WORKSPACE_REACH_M or radius <= 1e-9:
+        return position
+    return position * (WORKSPACE_REACH_M / radius)
 
 
 def _compute_session_frame_from_two_motions(
@@ -703,9 +728,12 @@ class _PerArm:
     # null-space jitter on the 5-DOF arm (vs using noisy current joints).
     kinematics: Any = None
     last_q_sol: _np.ndarray = field(default_factory=lambda: _np.zeros(5, dtype=float))
-    # Per-arm EMA-smoothed VR rotvec in robot frame. Kills high-frequency
-    # controller noise above the deadband. Reset at each RESET.
-    rotvec_ema: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Per-arm filtered target state. Position uses controller-delta EMA before
+    # integration; orientation uses SLERP EMA on the actual IK target; joints use
+    # EMA after IK to damp solver noise before motor rate caps.
+    pos_ema: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    smoothed_R_target: _np.ndarray = field(default_factory=lambda: _np.eye(3))
+    last_q_filtered: Optional[_np.ndarray] = None
     # Anchor orientation matrix (3×3) captured at RESET. Combined with the
     # current controller quaternion, gives the absolute desired EE orientation.
     anchor_R_robot: _np.ndarray = field(default_factory=lambda: _np.eye(3))
@@ -775,36 +803,63 @@ class VRTeleopSession:
         file exists or the file is malformed. Also reads per-arm invert_lateral
         flags from config/xlerobot.yaml's `vr:` section, both the value AND
         whether it's explicitly set (override mode). Also reads the global
-        `rotvec_ema_alpha` smoothing factor."""
-        # Read rotvec_ema_alpha (0.0..1.0; default 0.6).
+        smoothing and rate-limit factors."""
         import yaml
-        global ROTVEC_EMA_ALPHA
+        global KP, EE_DELTA_LIMIT_M, WRIST_RAD_DELTA_LIMIT
+        global POS_EMA_ALPHA, ORI_EMA_ALPHA, JOINT_EMA_ALPHA
         try:
             cfg = yaml.safe_load((REPO_ROOT / "config" / "xlerobot.yaml").read_text()) or {}
             vr_section = cfg.get("vr") or {}
-            alpha = vr_section.get("rotvec_ema_alpha")
-            if alpha is not None:
-                ROTVEC_EMA_ALPHA = max(0.0, min(1.0, float(alpha)))
-                log.info("rotvec_ema_alpha loaded from YAML: %s", ROTVEC_EMA_ALPHA)
-        except Exception as e:
-            log.warning("could not read rotvec_ema_alpha from YAML: %s", e)
-        invert_flags = _vrcal.read_invert_lateral_flags()
-        overrides    = _vrcal.read_invert_lateral_overrides()
-        for side in ("left", "right"):
-            arm = self._arms[side]
-            arm.invert_lateral = invert_flags.get(side, False)
-            arm.invert_lateral_override = overrides.get(side, False)
-            M = _vrcal.matrix_for_arm(side)
-            if M is None:
-                continue
-            arm.session_vr_to_robot = M
-            data = _vrcal.read_for_arm(side) or {}
-            arm.cal_last_fwd_m = float(data.get("forward_motion_m", 0.0))
-            arm.cal_last_up_m  = float(data.get("up_motion_m", 0.0))
+            def _float_key(name: str, default: float, lo: float, hi: float) -> float:
+                value = vr_section.get(name)
+                if value is None:
+                    return default
+                return max(lo, min(hi, float(value)))
+
+            KP = _float_key("kp", KP, 0.0, 1.0)
+            EE_DELTA_LIMIT_M = _float_key("ee_delta_limit_m", EE_DELTA_LIMIT_M, 0.001, 0.05)
+            wrist_deg = _float_key("wrist_delta_limit_deg", math.degrees(WRIST_RAD_DELTA_LIMIT), 1.0, 30.0)
+            WRIST_RAD_DELTA_LIMIT = math.radians(wrist_deg)
+            POS_EMA_ALPHA = _float_key("pos_ema_alpha", POS_EMA_ALPHA, 0.0, 1.0)
+            # Backward-compatible alias: older configs used rotvec_ema_alpha.
+            ori_alpha = vr_section.get("ori_ema_alpha", vr_section.get("rotvec_ema_alpha"))
+            if ori_alpha is not None:
+                ORI_EMA_ALPHA = max(0.0, min(1.0, float(ori_alpha)))
+            JOINT_EMA_ALPHA = _float_key("joint_ema_alpha", JOINT_EMA_ALPHA, 0.0, 1.0)
+            joint_caps = vr_section.get("joint_deg_caps") or {}
+            if isinstance(joint_caps, dict):
+                for joint, cap in joint_caps.items():
+                    if joint in PER_TICK_DEG_CAPS:
+                        PER_TICK_DEG_CAPS[joint] = max(0.1, min(30.0, float(cap)))
             log.info(
-                "[%s] restored saved VR calibration (invert_lateral=%s, override=%s)",
-                side, arm.invert_lateral, arm.invert_lateral_override,
+                "VR smoothing loaded: kp=%.2f pos_ema=%.2f ori_ema=%.2f joint_ema=%.2f "
+                "ee_cap=%.3fm wrist_cap=%.1f°",
+                KP, POS_EMA_ALPHA, ORI_EMA_ALPHA, JOINT_EMA_ALPHA,
+                EE_DELTA_LIMIT_M, math.degrees(WRIST_RAD_DELTA_LIMIT),
             )
+        except Exception as e:
+            log.warning("could not read VR smoothing config from YAML: %s", e)
+        for side in ("left", "right"):
+            self._restore_persisted_arm_config(side)
+
+    def _restore_persisted_arm_config(self, side: ArmSide) -> None:
+        """Restore saved calibration and lateral mapping for a freshly reset arm."""
+        invert_flags = _vrcal.read_invert_lateral_flags()
+        overrides = _vrcal.read_invert_lateral_overrides()
+        arm = self._arms[side]
+        arm.invert_lateral = invert_flags.get(side, False)
+        arm.invert_lateral_override = overrides.get(side, False)
+        M = _vrcal.matrix_for_arm(side)
+        if M is None:
+            return
+        arm.session_vr_to_robot = M
+        data = _vrcal.read_for_arm(side) or {}
+        arm.cal_last_fwd_m = float(data.get("forward_motion_m", 0.0))
+        arm.cal_last_up_m = float(data.get("up_motion_m", 0.0))
+        log.info(
+            "[%s] restored saved VR calibration (invert_lateral=%s, override=%s)",
+            side, arm.invert_lateral, arm.invert_lateral_override,
+        )
 
     # ── public API ────────────────────────────────────────────────────────────
     @property
@@ -1428,8 +1483,8 @@ class VRTeleopSession:
 
     def _capture_anchor(self, side: ArmSide) -> None:
         """RESET handler for ONE arm. Snapshot the EE pose via URDF FK; this
-        becomes the anchor for the absolute-pose IK pipeline. Resets the rotvec
-        EMA + delta accumulator; rebuilds the per-session VR→robot frame.
+        becomes the anchor for the absolute-pose IK pipeline. Resets the target
+        filters + delta accumulator; rebuilds the per-session VR→robot frame.
         """
         if not MOTORS.is_connected(side):
             return
@@ -1454,8 +1509,10 @@ class VRTeleopSession:
         arm.anchor_ee_pos = (float(T_now[0, 3]), float(T_now[1, 3]), float(T_now[2, 3]))
         arm.anchor_R_robot = T_now[:3, :3].copy()
         arm.offset_robot = (0.0, 0.0, 0.0)
-        arm.rotvec_ema = (0.0, 0.0, 0.0)
+        arm.pos_ema = (0.0, 0.0, 0.0)
+        arm.smoothed_R_target = T_now[:3, :3].copy()
         arm.last_q_sol = q_now_deg.copy()
+        arm.last_q_filtered = q_now_deg.copy()
         arm.delta.drain()
 
         # Build per-session VR→robot frame from controller's anchor quat. XLeVR
@@ -1612,6 +1669,12 @@ class VRTeleopSession:
                                         "arm may not have reached the saved pose",
                                         side, elapsed)
 
+                # Dataset capture: one frame per drive tick when recording is on,
+                # even if the active arm is stationary, grip is released, or the
+                # VR watchdog skips motor writes. Passive arms still contribute
+                # their observation.state.
+                self._record_frame_if_active()
+
                 # Phase 2: command the active arm if engaged + calibrated.
                 if not engaged or active is None or active not in connected:
                     next_tick = self._sleep_until(next_tick)
@@ -1636,6 +1699,12 @@ class VRTeleopSession:
                 # Watchdog: skip if last goal too stale (controller put down).
                 goal_age = now - goal.received_at if goal.has_data else 1e9
                 if not goal.has_data or goal_age > GOAL_SKIP_AGE_S:
+                    next_tick = self._sleep_until(next_tick)
+                    continue
+                if goal.mode != "position":
+                    # Grip release sends IDLE. Do not let EMA filter tails keep
+                    # moving the arm after control is intentionally released.
+                    arm.pos_ema = (0.0, 0.0, 0.0)
                     next_tick = self._sleep_until(next_tick)
                     continue
                 if not arm.calibrated:
@@ -1675,11 +1744,6 @@ class VRTeleopSession:
                 # Debug: per-arm gripper trigger/target/sent/present log (1Hz).
                 self._debug_log_gripper(active, goal, arm.targets,
                                          final, present_full, now)
-
-                # Dataset capture: one frame per drive tick when recording is on.
-                # Pulls present joints from BOTH arms (so a passive arm's state
-                # still lands in the dataset).
-                self._record_frame_if_active()
 
             except Exception as e:
                 log.exception("drive loop error: %s", e)
@@ -2138,7 +2202,14 @@ class VRTeleopSession:
         # Save the episode OUTSIDE the session lock — `end_episode` flushes
         # frames + may invoke video encoding which can take a while.
         if not enabled and rec is not None:
-            rec.end_episode()
+            saved = rec.end_episode()
+            # LeRobot buffers episode metadata until finalize(); without this,
+            # the viewer sees data/video files but no meta/episodes parquet.
+            if saved:
+                rec.finalize()
+                with self._lock:
+                    if self._recorder is rec:
+                        self._recorder = None
         return self._recording
 
     def _record_frame_if_active(self) -> None:
@@ -2204,15 +2275,14 @@ class VRTeleopSession:
           1. Transform VR deltas through `arm.session_vr_to_robot` to robot frame.
           2. invert_lateral (if set): mirror lateral components.
           3. Deadband: zero out sub-noise-threshold deltas.
-          4. Rotvec EMA smoothing: kills high-frequency controller noise.
-          5. Scale + per-tick EE/wrist caps.
+          4. Position-delta EMA: kills high-frequency controller translation noise.
+          5. Scale + per-tick EE caps.
           6. Integrate position offset → target position = anchor + offset.
-          7. Compute absolute desired orientation: anchor_R × (M @ R_delta_vr × Mᵀ).
-          8. Soft-saturate target to workspace (`EE_BOUNDS` box; no radial-to-origin
-             projection — boundaries are tested individually with axis-wise clamp).
+          7. Compute absolute desired orientation and smooth it with quaternion SLERP.
+          8. Soft-saturate target to workspace (`EE_BOUNDS` box + reach sphere).
           9. URDF/placo IK with `position_weight=1.0, orientation_weight=0.1`
              and `last_q_sol` as initial guess (kills null-space jitter).
-          10. Build `_LiveTargets` from IK output + gripper from trigger.
+          10. EMA-filter joint targets and build `_LiveTargets` + gripper.
         """
         from scipy.spatial.transform import Rotation as _R
         arm = self._arms[side]
@@ -2232,27 +2302,25 @@ class VRTeleopSession:
             dp_robot = _np.zeros(3)
         if float(_np.linalg.norm(dr_robot)) < ROTVEC_DEADBAND_RAD:
             dr_robot = _np.zeros(3)
+        orientation_moved = float(_np.linalg.norm(dr_robot)) > 0.0
 
-        # 4. Rotvec EMA smoothing (drives the wrist component of orientation IK).
-        a = ROTVEC_EMA_ALPHA
-        arm.rotvec_ema = (
-            a * float(dr_robot[0]) + (1.0 - a) * arm.rotvec_ema[0],
-            a * float(dr_robot[1]) + (1.0 - a) * arm.rotvec_ema[1],
-            a * float(dr_robot[2]) + (1.0 - a) * arm.rotvec_ema[2],
+        # 4. Position-delta EMA. The filter has unity DC gain, so a finite hand
+        # motion still integrates to the same final offset after the tail settles.
+        a_pos = POS_EMA_ALPHA
+        arm.pos_ema = (
+            a_pos * float(dp_robot[0]) + (1.0 - a_pos) * arm.pos_ema[0],
+            a_pos * float(dp_robot[1]) + (1.0 - a_pos) * arm.pos_ema[1],
+            a_pos * float(dp_robot[2]) + (1.0 - a_pos) * arm.pos_ema[2],
         )
-        dr_smoothed = _np.array(arm.rotvec_ema, dtype=float)
+        dp_smoothed = _np.array(arm.pos_ema, dtype=float)
 
-        # 5. Scale + per-tick caps (safety nets; orientation now smoothed first).
+        # 5. Scale + per-tick caps.
         ee_cap = EE_DELTA_LIMIT_M * scale
         wrist_cap = WRIST_RAD_DELTA_LIMIT * scale
-        dp = dp_robot * scale
+        dp = dp_smoothed * scale
         dp_norm = float(_np.linalg.norm(dp))
         if dp_norm > ee_cap:
             dp = dp * (ee_cap / dp_norm)
-        dr = dr_smoothed * scale
-        dr_norm = float(_np.linalg.norm(dr))
-        if dr_norm > wrist_cap:
-            dr = dr * (wrist_cap / dr_norm)
 
         # 6. Position offset: integrate UNCLAMPED so user hand-motion always
         # returns to anchor (no hysteresis when target hits a bound).
@@ -2269,40 +2337,42 @@ class VRTeleopSession:
         #    still, the wrist target stays put exactly.
         anchor_q = arm.anchor.ctrl_quat
         current_q = goal.rotation_quat
-        if anchor_q is not None and current_q is not None:
+        if anchor_q is not None and current_q is not None and orientation_moved:
             try:
                 R_anchor_vr  = _R.from_quat(_np.array(anchor_q))
                 R_current_vr = _R.from_quat(_np.array(current_q))
                 R_delta_vr   = R_current_vr * R_anchor_vr.inv()
                 # Similarity transform: rotation in VR frame → rotation in robot frame.
                 R_delta_robot = M @ R_delta_vr.as_matrix() @ M.T
-                # Lateral mirror: we want to flip rotations around BOTH X (roll)
-                # and Y (pitch) while preserving Z (yaw — handled by pan). That's
-                # conjugation by diag(1,1,-1) — a reflection in the xy plane.
-                # Using diag(1,-1,1) only flips X rotations and leaves pitch
-                # untouched (rotation around Y is preserved by xz-plane mirror).
-                if arm.invert_lateral:
-                    D = _np.diag([1.0, 1.0, -1.0])
-                    R_delta_robot = D @ R_delta_robot @ D
-                # Apply to the anchor orientation (snapshotted at RESET).
-                R_target = R_delta_robot @ arm.anchor_R_robot
+                # Apply to the anchor orientation (snapshotted at RESET), then
+                # smooth the actual orientation fed to IK. The old rotvec EMA was
+                # bypassed here, so raw Quest quaternion jitter reached the wrist.
+                R_raw = R_delta_robot @ arm.anchor_R_robot
+                R_target = _slerp_rotation_matrix(
+                    arm.smoothed_R_target,
+                    R_raw,
+                    ORI_EMA_ALPHA,
+                    max_step_rad=wrist_cap,
+                )
+                arm.smoothed_R_target = R_target.copy()
             except Exception as e:
                 log.warning("[%s] orientation tracking failed (%s); freezing", side, e)
-                R_target = arm.target_T[:3, :3]
+                R_target = arm.smoothed_R_target
         else:
             # Pre-RESET or quat missing: hold previous target orientation.
-            R_target = arm.target_T[:3, :3]
+            R_target = arm.smoothed_R_target
 
         # 8. Target position from anchor + offset, axis-clamped to EE_BOUNDS
-        # (sanity box). URDF IK does the real soft-saturation against joint
-        # limits internally — outside-of-reach targets just return the closest
-        # reachable joint config rather than a hard jump.
+        # (sanity box), then radially clamped before IK to avoid placo hopping
+        # between local minima near the edge of the SO101 reach envelope.
         tx = arm.anchor_ee_pos[0] + arm.offset_robot[0]
         ty = arm.anchor_ee_pos[1] + arm.offset_robot[1]
         tz = arm.anchor_ee_pos[2] + arm.offset_robot[2]
         tx = max(EE_BOUNDS["x"][0], min(EE_BOUNDS["x"][1], tx))
         ty = max(EE_BOUNDS["y"][0], min(EE_BOUNDS["y"][1], ty))
         tz = max(EE_BOUNDS["z"][0], min(EE_BOUNDS["z"][1], tz))
+        target_pos = _clamp_to_workspace_reach(_np.array([tx, ty, tz], dtype=float))
+        tx, ty, tz = (float(target_pos[0]), float(target_pos[1]), float(target_pos[2]))
         arm.target_T[:3, 3] = (tx, ty, tz)
         arm.target_T[:3, :3] = R_target
 
@@ -2324,7 +2394,12 @@ class VRTeleopSession:
                 log.warning("[%s] IK output NaN/Inf; reusing previous q_sol", side)
                 q_sol = arm.last_q_sol
             else:
-                arm.last_q_sol = q_sol
+                if arm.last_q_filtered is None:
+                    arm.last_q_filtered = q_sol.copy()
+                a_joint = JOINT_EMA_ALPHA
+                q_sol = (1.0 - a_joint) * arm.last_q_filtered + a_joint * q_sol
+                arm.last_q_filtered = q_sol.copy()
+                arm.last_q_sol = q_sol.copy()
         except Exception as e:
             log.warning("[%s] IK failed (%s); reusing previous q_sol", side, e)
             q_sol = arm.last_q_sol

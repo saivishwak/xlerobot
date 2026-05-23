@@ -66,12 +66,24 @@ vr:
   #
   # Uncomment one of the lines below to manually override. With both commented,
   # the wizard handles each side automatically.
-  invert_lateral_left:  true
-  invert_lateral_right: true
-  # EMA smoothing on incoming controller rotation. 1.0 = no smoothing (raw),
-  # 0.0 = frozen. 0.6 kills high-freq noise without adding visible lag.
-  # Lower if wrist still jitters; higher if rotations feel mushy.
-  rotvec_ema_alpha: 0.6
+  # invert_lateral_left:  true
+  # invert_lateral_right: true
+  # Smooth VR control. 1.0 = raw input, lower = smoother with more lag.
+  kp: 0.75
+  ee_delta_limit_m: 0.006
+  wrist_delta_limit_deg: 5.0
+  pos_ema_alpha: 0.5
+  ori_ema_alpha: 0.4
+  joint_ema_alpha: 0.2
+  joint_deg_caps:
+    shoulder_pan: 5.0
+    shoulder_lift: 5.0
+    elbow_flex: 5.0
+    wrist_flex: 6.0
+    wrist_roll: 6.0
+    gripper: 15.0
+  # Backward-compatible alias still accepted by the backend:
+  # rotvec_ema_alpha: 0.6
 gripper:
   open_value: 0
   closed_value: 100

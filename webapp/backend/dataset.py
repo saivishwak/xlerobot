@@ -71,15 +71,34 @@ class DatasetRecorder:
         self._current_task: str = ""
 
         features = self._build_features(JOINT_ORDER, self.camera_roles, self.camera_shape)
-        self._dataset = LeRobotDataset.create(
-            repo_id=repo_id,
-            fps=self.fps,
-            features=features,
-            root=str(root) if root else None,
-            robot_type="xlerobot-bimanual-so101",
-            use_videos=True,                     # MP4-encode image streams
-            image_writer_threads=2,              # async JPEG → video encode
-        )
+        resolved_root = pathlib.Path(resolve_root(str(root) if root else None, repo_id))
+        has_info = (resolved_root / "meta" / "info.json").is_file()
+        has_episode_meta = any((resolved_root / "meta" / "episodes").glob("*/*.parquet"))
+        if has_info and has_episode_meta:
+            self._dataset = LeRobotDataset.resume(
+                repo_id=repo_id,
+                root=str(resolved_root),
+                revision="main",
+                image_writer_threads=2,
+            )
+        else:
+            if resolved_root.exists():
+                if has_info and not has_episode_meta:
+                    raise RuntimeError(
+                        "existing dataset root is not finalized/readable "
+                        f"(missing meta/episodes parquet): {resolved_root}. "
+                        "Move that directory aside or choose a new recording root."
+                    )
+                raise RuntimeError(f"dataset root exists but is not a LeRobot dataset: {resolved_root}")
+            self._dataset = LeRobotDataset.create(
+                repo_id=repo_id,
+                fps=self.fps,
+                features=features,
+                root=str(resolved_root),
+                robot_type="xlerobot-bimanual-so101",
+                use_videos=True,                     # MP4-encode image streams
+                image_writer_threads=2,              # async JPEG → video encode
+            )
         log.info("dataset recorder ready: repo_id=%s fps=%d cameras=%s root=%s",
                  repo_id, self.fps, self.camera_roles, self._dataset.root)
 
