@@ -285,6 +285,12 @@ def load_dataset_config() -> dict[str, Any]:
         # interpolating to the saved home pose first. Required for VLA data
         # collection so all episodes start from the same proprioception state.
         "home_before_episode": False,
+        # Absolute filesystem path where episodes are written. Null/missing
+        # → use HuggingFace's default (`$HF_LEROBOT_HOME` or
+        # `~/.cache/huggingface/lerobot/<repo_id>/`). Set this in YAML or via
+        # the Recording card's "Storage path" input to write elsewhere
+        # (e.g., a big external drive).
+        "root": None,
     }
     try:
         cfg = yaml.safe_load((REPO_ROOT / "config" / "xlerobot.yaml").read_text()) or {}
@@ -293,6 +299,21 @@ def load_dataset_config() -> dict[str, Any]:
     except Exception as e:
         log.warning("could not read dataset config: %s; using defaults", e)
     return defaults
+
+
+def resolve_root(root: Optional[str], repo_id: str) -> str:
+    """Resolve the dataset root path. Handles ~ expansion and falls back to
+    the HF default (`$HF_LEROBOT_HOME/<repo_id>` or
+    `~/.cache/huggingface/lerobot/<repo_id>`) when None/empty."""
+    import os
+    if root:
+        return os.path.abspath(os.path.expanduser(str(root)))
+    hf_home = os.environ.get("HF_LEROBOT_HOME")
+    if hf_home:
+        return os.path.abspath(os.path.expanduser(os.path.join(hf_home, repo_id)))
+    return os.path.abspath(os.path.expanduser(
+        f"~/.cache/huggingface/lerobot/{repo_id}"
+    ))
 
 
 def role_camera_list() -> tuple[list[str], tuple[int, int, int]]:

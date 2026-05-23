@@ -114,20 +114,34 @@ def status() -> dict[str, dict[str, Any]]:
 
 def read_invert_lateral_flags() -> dict[str, bool]:
     """Read per-arm `vr.invert_lateral_<side>` flags from config/xlerobot.yaml.
-    Returns {'left': bool, 'right': bool}. Missing keys default to False.
+    Returns {'left': bool, 'right': bool}. Missing keys default to False."""
+    return {s: bool(_yaml_invert_raw().get(s)) for s in ("left", "right")}
 
-    Putting these in xlerobot.yaml (not in the auto-managed vr_calibration.yaml)
-    lets users edit them by hand, and keeps the calibration matrix file purely
-    derived from the wizard."""
+
+def read_invert_lateral_overrides() -> dict[str, bool]:
+    """For each side, is the YAML flag EXPLICITLY set (so it should override
+    the calibration wizard's auto-decision)?
+
+    Distinguishes 'key absent / null' (wizard decides) from 'key present with
+    bool value' (manual override; wizard skips its decision). The wizard's
+    step-3 lateral check catches matrix-math mirroring but NOT physical motor
+    mirroring (mirror-mounted arm with reversed sign convention), so users
+    need a manual escape hatch."""
+    raw = _yaml_invert_raw()
+    return {s: (raw.get(s) is not None) for s in ("left", "right")}
+
+
+def _yaml_invert_raw() -> dict[str, Any]:
+    """Internal: return the raw values (or None if absent) for invert flags."""
     import pathlib
     cfg_path = pathlib.Path(__file__).resolve().parents[2] / "config" / "xlerobot.yaml"
     try:
         cfg = yaml.safe_load(cfg_path.read_text()) or {}
     except Exception as e:
         log.warning("could not read %s for invert flags: %s", cfg_path, e)
-        return {"left": False, "right": False}
+        return {"left": None, "right": None}
     vr = cfg.get("vr") or {}
     return {
-        "left":  bool(vr.get("invert_lateral_left", False)),
-        "right": bool(vr.get("invert_lateral_right", False)),
+        "left":  vr.get("invert_lateral_left"),    # None / True / False
+        "right": vr.get("invert_lateral_right"),
     }

@@ -229,13 +229,17 @@ def api_vr_calibrate_cancel():
 
 @bp.post("/api/vr/recording")
 def api_vr_recording():
-    """Body: `{enabled: bool, task?: str}`. Mirror of the B button on the right
-    Quest controller. On `enabled=true`, lazily constructs the LeRobotDataset
-    writer and opens a new episode. On `enabled=false`, saves the current episode
-    to disk and returns."""
+    """Body: `{enabled: bool, task?: str, root?: str}`. Mirror of the B button
+    on the right Quest controller. On `enabled=true`, lazily constructs the
+    LeRobotDataset writer and opens a new episode. The optional `root` argument
+    is the absolute filesystem path where the dataset is written; null/empty
+    means use the HF default (`~/.cache/huggingface/lerobot/<repo_id>/`). Note
+    that root is only used at the first recorder init — subsequent episodes go
+    to the same place until the webapp is restarted or EMERGENCY STOP is hit."""
     body = request.get_json(silent=True) or {}
     if "enabled" not in body:
         abort(400, "enabled required")
     task = body.get("task") or ""
-    vr_mod.SESSION.set_recording(bool(body["enabled"]), task=task)
+    root = body.get("root") or ""
+    vr_mod.SESSION.set_recording(bool(body["enabled"]), task=task, root=root)
     return jsonify(vr_mod.SESSION.status())

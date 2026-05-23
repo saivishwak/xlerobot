@@ -1,7 +1,7 @@
 import {
   Alert, Badge, Box, Button, Card, CopyButton, Container, Grid, Group, Modal,
   SegmentedControl, SimpleGrid, Slider, Stack, Switch,
-  Text, Title, Tooltip,
+  Text, TextInput, Title, Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
@@ -153,7 +153,7 @@ function EngagementCard({ s, onEngage, busy }: {
   onEngage: (engaged: boolean, scale: number, activeArm?: ArmSide) => void;
   busy: boolean;
 }) {
-  const [localScale, setLocalScale] = useState(1.0);
+  const [localScale, setLocalScale] = useState(0.5);
   useEffect(() => { if (s) setLocalScale(s.scale); }, [s?.scale]);
 
   const connectedSides = s?.connected_sides ?? [];
@@ -217,7 +217,7 @@ function EngagementCard({ s, onEngage, busy }: {
         <Box>
           <Group justify="space-between" mb={2}>
             <Text fz="xs" fw={600}>Speed scale: <span className="mono">{localScale.toFixed(2)}</span></Text>
-            <Text fz="xs" c="dimmed">1.0 = true 1:1 hand-to-EE; lower for fine work</Text>
+            <Text fz="xs" c="dimmed">0.5 default (30 cm/s) · 1.0 is 1:1 hand-to-EE · lower for fine work</Text>
           </Group>
           <Slider
             min={0.1} max={1.0} step={0.05} value={localScale}
@@ -348,10 +348,15 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
         {/* Progress badges: shows which steps are done */}
         <Group gap={4} mb="sm">
           <Badge size="xs" color={fwdDone ? "teal" : "indigo"} variant={fwdDone ? "filled" : "light"}>
-            1. forward axis {fwdDone ? `✓ ${fwdCm} cm` : ""}
+            1. forward {fwdDone ? `✓ ${fwdCm} cm` : ""}
           </Badge>
-          <Badge size="xs" color="indigo" variant={fwdDone ? "filled" : "light"}>
-            2. up axis
+          <Badge size="xs" color={cal.wizard_up_captured ? "teal" : "indigo"}
+                 variant={cal.wizard_up_captured ? "filled" : "light"}>
+            2. up {cal.wizard_up_captured ? `✓ ${(cal.wizard_last_up_m * 100).toFixed(1)} cm` : ""}
+          </Badge>
+          <Badge size="xs" color="indigo"
+                 variant={cal.wizard_up_captured ? "filled" : "light"}>
+            3. left
           </Badge>
         </Group>
 
@@ -359,7 +364,7 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
           {/* STEP 1: forward */}
           {wizard === "awaiting_anchor_fwd" && (
             <Alert color="indigo">
-              <Text fz="sm" fw={600}>Step 1 of 2 — Capture forward axis</Text>
+              <Text fz="sm" fw={600}>Step 1 of 3 — Capture forward axis</Text>
               <Text fz="xs" mt={4}>
                 Put on the headset, stand facing the robot the way you'd
                 naturally operate it. Hold the {side} controller at chest
@@ -374,7 +379,7 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
           {wizard === "motioning_fwd" && (
             <>
               <Alert color={enough ? "teal" : "indigo"}>
-                <Text fz="sm" fw={600}>Step 1 of 2 — Move FORWARD</Text>
+                <Text fz="sm" fw={600}>Step 1 of 3 — Move FORWARD</Text>
                 <Text fz="xs" mt={4}>
                   <b>Keep grip held.</b> Move your hand straight FORWARD (toward
                   the robot, away from your body) ~{target_cm} cm. Then release grip.
@@ -418,10 +423,55 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
           {wizard === "motioning_up" && (
             <>
               <Alert color={enough ? "teal" : "indigo"}>
-                <Text fz="sm" fw={600}>Step 2 of 2 — Move UP</Text>
+                <Text fz="sm" fw={600}>Step 2 of 3 — Move UP</Text>
                 <Text fz="xs" mt={4}>
                   <b>Keep grip held.</b> Move your hand straight UP ~{target_cm} cm.
-                  Then release grip — calibration completes automatically.
+                  Then release grip.
+                </Text>
+              </Alert>
+              <Group justify="space-between" mt={4}>
+                <Text fz="sm">Motion so far</Text>
+                <Badge color={enough ? "teal" : "indigo"} variant="filled">
+                  {motion_cm} cm
+                </Badge>
+              </Group>
+              <Slider
+                value={cal.wizard_motion_m * 100}
+                max={Math.max(cal.wizard_target_m * 100, 1)}
+                min={0} disabled
+                color={enough ? "teal" : "indigo"}
+                marks={[
+                  { value: 0, label: "0" },
+                  { value: Number(min_cm), label: `min ${min_cm}` },
+                  { value: Number(target_cm), label: `${target_cm}` },
+                ]}
+              />
+            </>
+          )}
+
+          {/* STEP 3: left (lateral verification) */}
+          {wizard === "awaiting_anchor_left" && (
+            <Alert color="indigo">
+              <Text fz="sm" fw={600}>Step 3 of 3 — Verify lateral direction</Text>
+              <Text fz="xs" mt={4}>
+                Forward + up axes captured. Now we verify the lateral sign so
+                "your left" actually maps to "robot left" (and not the opposite).
+              </Text>
+              <Text fz="xs" mt={4} fw={600}>
+                Squeeze the GRIP button. KEEP IT HELD and move your hand to
+                YOUR LEFT (sideways) ~{target_cm} cm. Then release grip.
+              </Text>
+            </Alert>
+          )}
+          {wizard === "motioning_left" && (
+            <>
+              <Alert color={enough ? "teal" : "indigo"}>
+                <Text fz="sm" fw={600}>Step 3 of 3 — Move LEFT</Text>
+                <Text fz="xs" mt={4}>
+                  <b>Keep grip held.</b> Move your hand to YOUR LEFT (sideways)
+                  ~{target_cm} cm. Then release grip — calibration completes
+                  automatically and the invert flag is set if the lateral axis
+                  is mirrored.
                 </Text>
               </Alert>
               <Group justify="space-between" mt={4}>
@@ -465,6 +515,16 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
           <Badge size="xs" color="indigo" variant="light">
             yaw {(cal?.session_yaw_deg ?? 0).toFixed(0)}°
           </Badge>
+          {cal?.confidence && (
+            <Tooltip label={cal.confidence === "poor"
+              ? "Captured motions were too parallel — calibration matrix is shaky. Re-run the wizard with more orthogonal forward/up/left motions."
+              : "Captured motions were well-separated; matrix is robust."}>
+              <Badge size="xs" variant="light"
+                     color={cal.confidence === "good" ? "teal" : "yellow"}>
+                confidence: {cal.confidence}
+              </Badge>
+            </Tooltip>
+          )}
           {anchored && (
             <Badge size="xs" variant="light"
                    color={ofsMag < 0.005 ? "gray" : ofsMag < 0.15 ? "teal" : "yellow"}>
@@ -524,6 +584,16 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
             . Will auto-load next session.
           </Text>
         </Group>
+      )}
+      {cal?.confidence === "poor" && (
+        <Alert color="yellow" mt="xs" icon={<IconAlertTriangleFilled />}>
+          <Text fz="xs">
+            Calibration confidence is <b>poor</b>: your forward/up/left motions
+            were too parallel for the matrix to be reliable. Click <b>Calibrate</b>{" "}
+            again and make each motion more distinctly perpendicular — forward
+            should clearly differ from up, and left from forward.
+          </Text>
+        </Alert>
       )}
     </Card>
   );
@@ -689,21 +759,32 @@ function HomeCard({ side, armState, onCapture, onGoHome, onCancelHome,
   );
 }
 
-/** Recording toggle. Mirrors the B-button-on-right-controller state from the
- *  backend. Writes a LeRobotDataset v2 with action + observation.state + cameras. */
-function RecordingCard({ s, onToggle, busy }: {
+/** Recording toggle + per-episode task description. Mirrors the B-button on
+ *  right Quest controller. Writes LeRobotDataset v2 with action +
+ *  observation.state + cameras. The `task` string is stored on every frame
+ *  and used as conditioning for VLA training. */
+function RecordingCard({ s, task, onTaskChange, storageRoot, onStorageRootChange,
+                          onToggle, busy }: {
   s: VRStatus | undefined;
+  task: string;
+  onTaskChange: (t: string) => void;
+  storageRoot: string;
+  onStorageRootChange: (path: string) => void;
   onToggle: (enabled: boolean) => void;
   busy: boolean;
 }) {
   const recording = !!s?.recording;
   const info = s?.recording_info;
+  const taskOk = task.trim().length > 0;
+  // Compute the effective placeholder: whatever the backend says will be used
+  // if the user leaves the field blank.
+  const defaultRoot = info?.root || "~/.cache/huggingface/lerobot/<repo_id>/";
   return (
     <Card withBorder padding="md"
           style={{ borderColor: recording ? "var(--mantine-color-grape-7)" : undefined,
                    background: recording ? "rgba(190, 70, 200, 0.06)" : undefined }}>
-      <Group justify="space-between" wrap="nowrap">
-        <Stack gap={0}>
+      <Stack gap="sm">
+        <Group justify="space-between" wrap="nowrap">
           <Group gap="xs">
             <Text fw={700} fz="md">Dataset recording</Text>
             {recording ? (
@@ -718,27 +799,48 @@ function RecordingCard({ s, onToggle, busy }: {
             )}
             {recording && info?.frames_in_current_episode !== undefined && (
               <Badge color="grape" variant="light">
-                {info.frames_in_current_episode} frames this episode
+                {info.frames_in_current_episode} frames
               </Badge>
             )}
           </Group>
-          <Text fz="xs" c="dimmed">
-            Press <b>B</b> on the right Quest controller, or click here, to toggle.
-            Captures both arms' commanded + present joints and every camera with a
-            role assigned on the Cameras page. Writes LeRobot v2 to{" "}
-            <span className="mono">{info?.repo_id || "(configure dataset.repo_id)"}</span>.
-          </Text>
-        </Stack>
-        <Button
-          color={recording ? "gray" : "grape"}
-          variant={recording ? "default" : "filled"}
-          leftSection={recording ? <IconPlayerStop size={16} /> : <IconPlayerPlay size={16} />}
-          onClick={() => onToggle(!recording)}
-          disabled={busy}
-        >
-          {recording ? "Stop recording" : "Start recording"}
-        </Button>
-      </Group>
+          <Button
+            color={recording ? "gray" : "grape"}
+            variant={recording ? "default" : "filled"}
+            leftSection={recording ? <IconPlayerStop size={16} /> : <IconPlayerPlay size={16} />}
+            onClick={() => onToggle(!recording)}
+            disabled={busy || (!recording && !taskOk)}
+          >
+            {recording ? "Stop recording" : "Start recording"}
+          </Button>
+        </Group>
+
+        <TextInput
+          label="Task description"
+          description="Natural-language instruction this episode demonstrates. Required for LeRobot v2 — stored on every frame and used as conditioning for VLA training. Example: 'Pick the red block and place it in the bin'."
+          placeholder="Pick the red block and place it in the bin"
+          value={task}
+          onChange={(e) => onTaskChange(e.currentTarget.value)}
+          disabled={recording}
+          error={!taskOk && !recording ? "task description required before starting an episode" : false}
+        />
+
+        <TextInput
+          label="Storage path"
+          description="Absolute filesystem path where episodes are written. Leave blank to use the HuggingFace default. The path is captured on the FIRST Start recording — change requires backend restart or EMERGENCY STOP."
+          placeholder={defaultRoot}
+          value={storageRoot}
+          onChange={(e) => onStorageRootChange(e.currentTarget.value)}
+          disabled={recording || (info?.episodes_saved ?? 0) > 0}
+        />
+
+        <Text fz="xs" c="dimmed">
+          Press <b>B</b> on the right Quest controller, or click <b>Start recording</b>, to
+          begin an episode. Both arms' commanded + present joints and every camera with a
+          role assigned on the Cameras page are captured. Writes LeRobot v2 to{" "}
+          <span className="mono">{info?.root || defaultRoot}</span> · repo_id{" "}
+          <span className="mono">{info?.repo_id || "(configure dataset.repo_id)"}</span>.
+        </Text>
+      </Stack>
     </Card>
   );
 }
@@ -765,6 +867,28 @@ export function VRTeleop() {
   );
   const [busy, setBusy] = useState(false);
   const [eStopConfirm, setEStopConfirm] = useState(false);
+  // Per-episode task description. Sent to the recorder on every Start; LeRobot
+  // v2 stores it on each frame and uses it as conditioning input for VLA training.
+  const [taskDescription, setTaskDescription] = useState("");
+  // Dataset storage root override (empty = use backend's effective default).
+  // Locked-in on first Start recording; subsequent edits ignored until the
+  // backend restarts or EMERGENCY STOP destroys the recorder.
+  const [storageRoot, setStorageRoot] = useState("");
+  // Pre-fill from the backend's cached last_task on first non-empty status load,
+  // so a page refresh doesn't wipe what the user already typed.
+  const [taskInitialized, setTaskInitialized] = useState(false);
+  useEffect(() => {
+    if (taskInitialized) return;
+    const cached = s?.recording_info?.last_task;
+    if (cached) {
+      setTaskDescription(cached);
+      setTaskInitialized(true);
+    } else if (s) {
+      // Status loaded but no cached task — mark initialized so we don't
+      // overwrite the user's typing later.
+      setTaskInitialized(true);
+    }
+  }, [s, taskInitialized]);
 
   const handleConnect = async (arm: ArmSide) => {
     setBusy(true);
@@ -814,7 +938,12 @@ export function VRTeleop() {
 
   const handleRecordingToggle = async (enabled: boolean) => {
     try {
-      await api.vrSetRecording(enabled);
+      // Only send task on START — on STOP, task is irrelevant.
+      await api.vrSetRecording(
+        enabled,
+        enabled ? taskDescription.trim() : "",
+        enabled ? storageRoot.trim() : "",
+      );
       await mutate();
     } catch (e) {
       notifications.show({ color: "red", title: "Recording toggle failed",
@@ -944,7 +1073,13 @@ export function VRTeleop() {
         />
         <VREndpointCard s={s} />
         <EngagementCard s={s} onEngage={handleEngage} busy={busy} />
-        <RecordingCard s={s} onToggle={handleRecordingToggle} busy={busy} />
+        <RecordingCard s={s}
+                       task={taskDescription}
+                       onTaskChange={setTaskDescription}
+                       storageRoot={storageRoot}
+                       onStorageRootChange={setStorageRoot}
+                       onToggle={handleRecordingToggle}
+                       busy={busy} />
 
         <Grid>
           <Grid.Col span={{ base: 12, md: 6 }}>

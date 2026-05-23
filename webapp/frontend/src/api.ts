@@ -47,20 +47,30 @@ export interface VRArmState {
     target_ee_pos: [number, number, number];
     /** Yaw (deg) of the active session VR→robot frame relative to default. */
     session_yaw_deg: number;
-    /** Guided 2-vector calibration wizard state. */
+    /** Guided 3-vector calibration wizard state. */
     wizard_state:
       | "idle"
-      | "awaiting_anchor_fwd" | "motioning_fwd"
-      | "awaiting_anchor_up"  | "motioning_up";
+      | "awaiting_anchor_fwd"  | "motioning_fwd"
+      | "awaiting_anchor_up"   | "motioning_up"
+      | "awaiting_anchor_left" | "motioning_left";
     /** Live motion magnitude (m) accumulated during the current motion-capture. */
     wizard_motion_m: number;
     wizard_target_m: number;
     wizard_min_m: number;
-    /** Most-recently-captured forward / up motion magnitudes (m). */
+    /** Most-recently-captured forward / up / left motion magnitudes (m). */
     wizard_last_fwd_m: number;
     wizard_last_up_m: number;
+    wizard_last_left_m: number;
     wizard_fwd_captured: boolean;
     wizard_up_captured: boolean;
+    wizard_left_captured: boolean;
+    /** Result of the lateral-check step. True = matrix mirroring detected,
+     *  invert_lateral was auto-flipped on by the wizard. */
+    invert_lateral: boolean;
+    /** "good" = captured motion vectors well-separated, matrix is robust.
+     *  "poor" = vectors too parallel (cos > 0.6); re-run wizard for better
+     *  results. */
+    confidence: "good" | "poor";
     /** Whether the most-recent calibration has been written to
      *  `config/vr_calibration.yaml` and reload on next startup. */
     persisted: {
@@ -95,6 +105,10 @@ export interface VRStatus {
     episodes_saved: number;
     frames_in_current_episode: number;
     repo_id: string | null;
+    /** Most-recent task description (from UI or previous session). */
+    last_task: string;
+    /** Absolute filesystem path where datasets are/will be written. */
+    root: string;
   };
   /** 0.1..1.0 — multiplier on VR delta caps */
   scale: number;
@@ -161,10 +175,13 @@ export const api = {
     }),
   vrEmergencyStop: () =>
     req<VRStatus>("/api/vr/emergency_stop", { method: "POST" }),
-  /** UI-side mirror of the B button on the right Quest controller. */
-  vrSetRecording: (enabled: boolean) =>
+  /** UI-side mirror of the B button on the right Quest controller. Pass the
+   *  per-episode task description; LeRobot v2 stores it on every frame and
+   *  uses it as conditioning input for VLA training. The optional `root` arg
+   *  overrides where the dataset is written (null/empty = HF default). */
+  vrSetRecording: (enabled: boolean, task: string = "", root: string = "") =>
     req<VRStatus>("/api/vr/recording", {
-      method: "POST", body: JSON.stringify({ enabled }),
+      method: "POST", body: JSON.stringify({ enabled, task, root }),
     }),
   /** Begin a guided motion-based calibration for one arm. */
   vrCalibrateStart: (arm: ArmSide) =>

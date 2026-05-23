@@ -55,12 +55,23 @@ vr:
   host_ip: 0.0.0.0
   https_port: 5443
   websocket_port: 5442
-  # If motion feels mirrored (e.g., when standing behind the robot, moving hand
-  # RIGHT makes the arm pan LEFT, and wrist roll/flex are reversed too), flip
-  # the corresponding side's flag to true. Per arm so you can mirror just one
-  # if needed. Read on backend startup — restart the webapp after editing.
-  invert_lateral_left: false
-  invert_lateral_right: false
+  # Lateral-mirror flag per arm.
+  #
+  #   KEY ABSENT  → calibration wizard's step-3 lateral check decides each run
+  #                 (default — works for most setups).
+  #   true        → MANUAL OVERRIDE: always flip lateral on this arm, the
+  #                 wizard's auto-decision is ignored. Use this for arms with
+  #                 physically-mirrored motor mounting that the math can't see.
+  #   false       → MANUAL OVERRIDE: never flip on this arm.
+  #
+  # Uncomment one of the lines below to manually override. With both commented,
+  # the wizard handles each side automatically.
+  invert_lateral_left:  true
+  invert_lateral_right: true
+  # EMA smoothing on incoming controller rotation. 1.0 = no smoothing (raw),
+  # 0.0 = frozen. 0.6 kills high-freq noise without adding visible lag.
+  # Lower if wrist still jitters; higher if rotations feel mushy.
+  rotvec_ema_alpha: 0.6
 gripper:
   open_value: 0
   closed_value: 100

@@ -107,6 +107,7 @@ class _ArmSession:
                 self._sync_calibration(self._arm)
                 self._refresh_bounds()
                 self._loosen_gripper_protections(self._arm)
+                self._stiffen_motor_pid(self._arm)
                 self.connected_at = time.time()
                 self.torque_enabled = True   # SOFollower.connect() torques on
                 self.last_error = None
@@ -285,6 +286,29 @@ class _ArmSession:
                     arm.bus.write_calibration(arm.calibration)
         except Exception as e:
             log.warning("calibration sync failed on %s: %s", self._side, e)
+
+    def _stiffen_motor_pid(self, arm) -> None:
+        """Override lerobot's conservative `P_Coefficient = 16` set by
+        SOFollower.configure(). lerobot's value is half of phospho's published
+        `P=32` and the Feetech factory default — and the trade-off shows up as
+        sluggish servo tracking that even tuned software smoothing can't fix.
+
+        Bumping to 24 (one notch below phospho's 32) gives noticeably tighter
+        position tracking without inducing oscillation on the SO-101's gear
+        train. The gripper is excluded (it has its own protection settings
+        from `_loosen_gripper_protections`).
+        """
+        if arm is None: return
+        try:
+            with arm.bus.torque_disabled():
+                for motor in arm.bus.motors:
+                    if motor == "gripper":
+                        continue
+                    arm.bus.write("P_Coefficient", motor, 20)
+            log.info("%s arm motors: P_Coefficient = 20 (was 16 from lerobot default)",
+                     self._side)
+        except Exception as e:
+            log.warning("could not stiffen motor PID on %s: %s", self._side, e)
 
     def _loosen_gripper_protections(self, arm) -> None:
         """Override the very conservative gripper protections that lerobot's
