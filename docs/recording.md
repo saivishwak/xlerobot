@@ -55,15 +55,25 @@ If `push_to_hub: true`, the recorder pushes to the Hub on `emergency_stop` (whic
 
 Quick sanity check before viewing
 
+```bash
 # Confirm episodes are on disk
 ls ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-teleop/data/chunk-000/
-# → episode_000000.parquet, episode_000001.parquet, ...
+# -> file-000.parquet
 
-# See per-episode metadata
-cat ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-teleop/meta/episodes.jsonl
-# → {"episode_index": 0, "tasks": ["Pick the red block..."], "length": 312, ...}
+# Confirm v3 episode metadata exists
+ls ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-teleop/meta/episodes/
+# -> chunk-000/file-000.parquet
 
 # Open viewer for the most recent
-uv run lerobot-dataset-viz --repo-id saivishwak/xlerobot-vr-teleop \
+uv run python scripts/lerobot_dataset_viz_main.py --repo-id saivishwak/xlerobot-vr-teleop \
   --episode-index $(ls ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-teleop/data/chunk-000/ |
 wc -l | awk '{print $1-1}')
+```
+
+Use the project wrapper instead of calling `lerobot-dataset-viz` directly. The vendored LeRobot checkout defaults to a version tag lookup for v3 datasets; the wrapper leaves the vendor code untouched, loads the Hub `main` revision instead, and defaults the dataloader to `--num-workers 0` to avoid shared-memory issues on small machines. To view another revision:
+
+```bash
+LEROBOT_DATASET_REVISION=my-branch uv run python scripts/lerobot_dataset_viz_main.py \
+  --repo-id saivishwak/xlerobot-vr-teleop \
+  --episode-index 0
+```
