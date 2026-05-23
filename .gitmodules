@@ -6,7 +6,13 @@
 	url = https://github.com/Vector-Wangel/XLeRobot/
 [submodule "XLerobot_xuweiwu"]
 	path = XLerobot_xuweiwu
-	url = https://github.com/xuweiwu/XLeRobot
+	url = git@github.com:saivishwak/XLeRobot_xuweiwu.git
+	# cert.pem / key.pem inside this submodule are regenerated per-machine
+	# and shouldn't appear as "modified content" in parent-repo status.
+	ignore = dirty
 [submodule "openpi"]
 	path = openpi
 	url = https://github.com/xuweiwu/openpi
+[submodule "SO-ARM100"]
+	path = SO-ARM100
+	url = https://github.com/TheRobotStudio/SO-ARM100.git

@@ -5,6 +5,24 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "aiohttp>=3.13.5",
+    "flask>=3.1.3",
+    "flask-cors>=6.0.2",
+    "jinja2>=3.1.6",
+    "lerobot[dataset,feetech,intelrealsense,kinematics]",
     "mani-skill>=3.0.1",
-    "torch>=2.12.0",
+    "openpi-client",
+    "pynput>=1.8.2",
+    "pyyaml>=6.0.3",
+    "websockets>=16.0",
 ]
+
+[tool.uv.workspace]
+members = [
+    "lerobot",
+    "openpi/packages/openpi-client",
+]
+
+[tool.uv.sources]
+openpi-client = { workspace = true, editable = true }
+lerobot = { workspace = true }

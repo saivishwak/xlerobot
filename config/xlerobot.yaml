@@ -1,0 +1,66 @@
+robot:
+  id: xlerobot
+  port_left_base: /dev/ttyACM1
+  port_right_head: /dev/ttyACM0
+  left_arm_id: left_follower_arm
+  right_arm_id: right_follower_arm
+  max_relative_target: null
+  use_degrees: true
+  home_pose:
+    left_arm_shoulder_pan: 26.8571
+    left_arm_shoulder_lift: -13.0989
+    left_arm_elbow_flex: -45.0989
+    left_arm_wrist_flex: 69.4066
+    left_arm_wrist_roll: -4.7033
+    left_arm_gripper: 0.9729
+    right_arm_shoulder_pan: -34.1099
+    right_arm_shoulder_lift: -20.3516
+    right_arm_elbow_flex: -43.7802
+    right_arm_wrist_flex: 78.8571
+    right_arm_wrist_roll: 3.2088
+    right_arm_gripper: 0.6241
+cameras:
+  left_wrist:
+    type: opencv
+    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:4.4:1.0-video-index0
+    fps: 30
+    width: 640
+    height: 480
+    fourcc: MJPG
+  right_wrist:
+    type: opencv
+    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:4.1:1.0-video-index0
+    fps: 30
+    width: 640
+    height: 480
+    fourcc: MJPG
+  head:
+    type: opencv
+    path: /dev/v4l/by-path/pci-0000:11:00.4-usb-0:1:1.0-video-index0
+    fps: 30
+    width: 640
+    height: 480
+    fourcc: MJPG
+dataset:
+  repo_id: saivishwak/xlerobot-vr-teleop
+  home_before_episode: true
+  fps: 30
+  push_to_hub: false
+pi05:
+  server_host: 127.0.0.1
+  server_port: 8000
+  action_horizon: 50
+  control_fps: 50
+vr:
+  host_ip: 0.0.0.0
+  https_port: 5443
+  websocket_port: 5442
+  # If motion feels mirrored (e.g., when standing behind the robot, moving hand
+  # RIGHT makes the arm pan LEFT, and wrist roll/flex are reversed too), flip
+  # the corresponding side's flag to true. Per arm so you can mirror just one
+  # if needed. Read on backend startup — restart the webapp after editing.
+  invert_lateral_left: false
+  invert_lateral_right: false
+gripper:
+  open_value: 0
+  closed_value: 100
