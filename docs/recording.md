@@ -9,7 +9,7 @@ Each frame contains:
 - `observation.state` — present joint positions (same 12-vector)
 - `observation.images.<role>` — video stream per camera with a role assigned (head, left_wrist, right_wrist)
 
-At 30 Hz, with 3 cameras at 640×480 BGR.
+At 30 Hz, with 3 cameras at 640×480 RGB.
 
 ## Configure
 

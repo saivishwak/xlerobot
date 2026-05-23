@@ -4,7 +4,7 @@ Wraps `lerobot.datasets.LeRobotDataset.create()` for write-mode capture during
 VR sessions. Each frame contains:
   - `action`              : commanded joint positions for both arms (12-vector)
   - `observation.state`   : present joint positions for both arms (12-vector)
-  - `observation.images.<role>` : (H, W, 3) BGR frame from each configured camera
+  - `observation.images.<role>` : (H, W, 3) RGB frame from each configured camera
 
 Episode boundary control:
   - `start_episode(task)` is called on the rising edge of either the B button
@@ -241,10 +241,11 @@ class DatasetRecorder:
 # ─── helpers used by VRTeleopSession to build the recorder ─────────────────
 
 def grab_camera_frames() -> dict[str, Optional[np.ndarray]]:
-    """Snapshot every role-assigned camera. Returns {role: BGR-ndarray-or-None}.
+    """Snapshot every role-assigned camera. Returns {role: RGB-ndarray-or-None}.
 
     Uses the existing CameraStream singletons so we don't open a second
-    VideoCapture per camera. Decodes the latest JPEG to numpy via cv2.imdecode.
+    VideoCapture per camera. Decodes the latest JPEG to numpy via cv2.imdecode,
+    then converts OpenCV's BGR layout to RGB for LeRobot/PIL video encoding.
     Subscriptions are reference-counted; we acquire while reading and release
     afterwards (matches how `/camera/<id>/snapshot` works)."""
     out: dict[str, Optional[np.ndarray]] = {}
@@ -264,7 +265,9 @@ def grab_camera_frames() -> dict[str, Optional[np.ndarray]]:
                 out[c.role] = None
                 continue
             arr = np.frombuffer(jpeg, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)   # BGR uint8 (H, W, 3)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             out[c.role] = img
         finally:
             stream.release()
