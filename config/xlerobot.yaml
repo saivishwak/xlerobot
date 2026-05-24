@@ -69,12 +69,14 @@ vr:
   # invert_lateral_left:  true
   # invert_lateral_right: true
   # Smooth VR control. 1.0 = raw input, lower = smoother with more lag.
-  kp: 0.75
+  kp: 1.0
   ee_delta_limit_m: 0.006
   wrist_delta_limit_deg: 5.0
   pos_ema_alpha: 0.5
   ori_ema_alpha: 0.4
   joint_ema_alpha: 0.2
+  wrist_flex_sign: 1
+  wrist_roll_sign: -1
   joint_deg_caps:
     shoulder_pan: 5.0
     shoulder_lift: 5.0

@@ -16,6 +16,11 @@ File format (`config/vr_calibration.yaml`):
       calibrated_at: '2026-05-24T12:34:56'
       forward_motion_m: 0.103
       up_motion_m: 0.092
+      left_motion_m: 0.088
+      invert_lateral: false
+      confidence: good
+      wrist_flex_sign: 1.0
+      wrist_roll_sign: -1.0
     right: { ... same shape ... }
 
 This file is auto-managed by the calibration wizard. Sides that haven't been
@@ -67,7 +72,23 @@ def matrix_for_arm(side: str) -> np.ndarray | None:
             log.warning("[%s] saved session_vr_to_robot has wrong shape %s; ignoring",
                         side, M.shape)
             return None
-        return M
+        if not np.all(np.isfinite(M)):
+            log.warning("[%s] saved session_vr_to_robot has non-finite values; ignoring", side)
+            return None
+        ortho = _orthonormalize_matrix(M)
+        error = float(np.linalg.norm(M.T @ M - np.eye(3)))
+        if error > 0.05:
+            log.warning(
+                "[%s] saved session_vr_to_robot is too skewed (orthogonality error %.3f); ignoring",
+                side, error,
+            )
+            return None
+        if error > 1e-3:
+            log.warning(
+                "[%s] saved session_vr_to_robot was slightly non-orthonormal (%.4f); using closest rotation",
+                side, error,
+            )
+        return ortho
     except Exception as e:
         log.warning("[%s] saved session_vr_to_robot is malformed: %s; ignoring", side, e)
         return None
@@ -75,22 +96,36 @@ def matrix_for_arm(side: str) -> np.ndarray | None:
 
 def write_for_arm(side: str, matrix: np.ndarray,
                    forward_motion_m: float = 0.0,
-                   up_motion_m: float = 0.0) -> None:
+                   up_motion_m: float = 0.0,
+                   left_motion_m: float = 0.0,
+                   invert_lateral: bool | None = None,
+                   confidence: str = "good",
+                   wrist_flex_sign: float | None = None,
+                   wrist_roll_sign: float | None = None) -> None:
     """Persist one arm's calibration. Preserves other arms' entries by reading
     the file first, mutating, and writing back. Note: invert toggles live in
     config/xlerobot.yaml's `vr:` section, not here."""
     existing = read_all()
-    existing[side] = {
-        "session_vr_to_robot": [[float(v) for v in row] for row in matrix],
+    M = _orthonormalize_matrix(np.array(matrix, dtype=float))
+    entry: dict[str, Any] = {
+        "session_vr_to_robot": [[float(v) for v in row] for row in M],
         "calibrated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "forward_motion_m": float(forward_motion_m),
         "up_motion_m": float(up_motion_m),
+        "left_motion_m": float(left_motion_m),
+        "confidence": str(confidence or "good"),
     }
+    if invert_lateral is not None:
+        entry["invert_lateral"] = bool(invert_lateral)
+    if wrist_flex_sign is not None:
+        entry["wrist_flex_sign"] = 1.0 if float(wrist_flex_sign) >= 0 else -1.0
+    if wrist_roll_sign is not None:
+        entry["wrist_roll_sign"] = 1.0 if float(wrist_roll_sign) >= 0 else -1.0
+    existing[side] = entry
     CFG_PATH.parent.mkdir(parents=True, exist_ok=True)
     header = (
         "# VR→robot calibration data. Auto-managed by the calibration wizard in\n"
-        "# the webapp — edit by re-running the wizard, not by hand. Per-arm\n"
-        "# 'invert_lateral' toggles live in config/xlerobot.yaml's `vr:` block.\n"
+        "# the webapp — edit by re-running the wizard, not by hand.\n"
     )
     body = yaml.safe_dump(existing, sort_keys=False, default_flow_style=None)
     CFG_PATH.write_text(header + body)
@@ -108,8 +143,23 @@ def status() -> dict[str, dict[str, Any]]:
             "calibrated_at": data.get("calibrated_at"),
             "forward_motion_m": float(data.get("forward_motion_m", 0.0)),
             "up_motion_m": float(data.get("up_motion_m", 0.0)),
+            "left_motion_m": float(data.get("left_motion_m", 0.0)),
+            "invert_lateral": data.get("invert_lateral"),
+            "confidence": data.get("confidence", "unknown"),
+            "wrist_flex_sign": data.get("wrist_flex_sign"),
+            "wrist_roll_sign": data.get("wrist_roll_sign"),
         }
     return out
+
+
+def _orthonormalize_matrix(matrix: np.ndarray) -> np.ndarray:
+    """Return the nearest proper 3D rotation matrix."""
+    u, _, vt = np.linalg.svd(matrix)
+    rot = u @ vt
+    if np.linalg.det(rot) < 0:
+        u[:, -1] *= -1.0
+        rot = u @ vt
+    return rot
 
 
 def read_invert_lateral_flags() -> dict[str, bool]:
