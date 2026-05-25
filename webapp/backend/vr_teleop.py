@@ -135,12 +135,26 @@ RECORD_BUTTON_BY_SIDE: dict[str, str] = {"right": "B"}
 # smaller than this is too noisy to reliably determine "user-forward" direction.
 CALIBRATION_MIN_MOTION_M: float = 0.05    # 5 cm
 CALIBRATION_TARGET_MOTION_M: float = 0.10  # the wizard says "move ~10 cm"
+WRIST_VERIFY_MIN_DEG: float = 8.0
+WRIST_VERIFY_TARGET_DEG: float = 20.0
 
 # Smoothing factors. 1.0 = raw input, 0.0 = frozen.
 POS_EMA_ALPHA: float = 0.5
 ORI_EMA_ALPHA: float = 0.4
-WRIST_FLEX_SIGN: float = 1.0
-WRIST_ROLL_SIGN: float = -1.0
+# Hardware polarity of the wrist motors, per arm. Loaded from
+# `config/xlerobot.yaml` (`vr.wrist_motor_polarity`) at startup.
+#
+# These are NOT the runtime `wrist_flex_sign` / `wrist_roll_sign` — those are
+# derived per session from the polarity combined with the session_vr_to_robot
+# matrix (see `_derive_wrist_signs_from_session`). The polarity is the only
+# truly invariant piece: it depends on motor mounting and wiring, not on where
+# the user stood when calibrating. Defaults below match the standard XLeRobot
+# SO101 build; override in yaml only when rewiring/remounting actually changes
+# a motor's direction.
+_WRIST_MOTOR_POLARITY: dict[str, dict[str, float]] = {
+    "left":  {"flex": -1.0, "roll": -1.0},
+    "right": {"flex": -1.0, "roll": -1.0},
+}
 
 
 # Homing: per-joint tolerance (degrees) to declare "arrived". 1.5° on
@@ -299,6 +313,8 @@ def _load_urdf_kinematics():
 # (controller's barrel direction at grip-press) becomes "robot forward" regardless
 # of which way they happen to be facing in the room.
 import numpy as _np
+from scipy.spatial.transform import Rotation as _R
+
 _VR_TO_ROBOT = _np.array([[0, 0, -1],
                           [-1, 0, 0],
                           [0, 1, 0]], dtype=float)
@@ -377,6 +393,102 @@ def _controller_rotation_delta_for_side(side: ArmSide, rotation_delta_vr: _np.nd
     return rot
 
 
+def _wrist_rotation_deg_since_anchor(
+    anchor_q: tuple[float, float, float, float],
+    release_q: tuple[float, float, float, float],
+) -> float:
+    """Total rotation (degrees) from anchor quaternion to release quaternion."""
+    R_anchor = _R.from_quat(anchor_q)
+    R_release = _R.from_quat(release_q)
+    R_rel = R_anchor.inv() * R_release
+    return math.degrees(float(_np.linalg.norm(_np.asarray(R_rel.as_rotvec(), dtype=float))))
+
+
+def _derive_wrist_signs_from_session(
+    side: ArmSide,
+    session_vr_to_robot: _np.ndarray,
+    polarity: dict[str, float],
+    pitch_canonical: Optional[tuple[float, float, float]] = None,
+) -> tuple[float, float]:
+    """Compute the per-session `wrist_flex_sign` / `wrist_roll_sign` analytically
+    from the session_vr_to_robot matrix and the hardware motor polarity.
+
+    Background
+    ----------
+    The runtime wrist mapping does
+
+        wrist_flex_delta_deg = wrist_flex_sign * (M @ rotvec_vr_anchor_local)[1]
+        wrist_roll_delta_deg = wrist_roll_sign * (M @ rotvec_vr_anchor_local)[0]
+
+    where rotvec_vr_anchor_local is the controller's rotation since engage,
+    expressed in its own anchor-local frame (post `_controller_rotation_delta_for_side`),
+    and M = session_vr_to_robot.
+
+    For the SAME physical user motion ("pitch wrist up"), the canonical
+    rotvec is constant in form. Multiplying by M maps that into robot frame,
+    and the SIGN of the resulting y-component depends on M — which legitimately
+    flips when the user calibrates from a different orientation.
+
+    To keep the wrist tracking the user invariant across calibrations, we
+    cannot pin `wrist_flex_sign` as a constant; we must combine the hardware
+    motor polarity (a true invariant — depends on wiring and mounting) with
+    the M-dependent observed sign of the canonical motion.
+
+    Canonical motions
+    -----------------
+    - "Pitch up": default WebXR controller anchor-local rotvec = +x. The
+      left-side handedness flip in `_controller_rotation_delta_for_side`
+      (transpose) negates this, so the *effective* canonical for left is -x.
+    - "Roll right": controller anchor-local rotvec = -z. Negated for left side.
+
+    Parameters
+    ----------
+    pitch_canonical : optional override (3-vector)
+        Empirical anchor-local unit rotvec captured by the wrist-verify
+        wizard step. SIDE HANDEDNESS ALREADY APPLIED, so it's used as-is.
+        Pass None to fall back to the WebXR analytical canonical above —
+        works for standard Quest/WebXR controllers, may be off for
+        non-standard ones.
+
+    Returns
+    -------
+    `(wrist_flex_sign, wrist_roll_sign)` — each ±1.0, ready to be written to
+    `arm.wrist_flex_sign` / `arm.wrist_roll_sign`.
+    """
+    M = _np.asarray(session_vr_to_robot, dtype=float)
+    if pitch_canonical is not None:
+        pitch_canon_local = _np.asarray(pitch_canonical, dtype=float)
+        norm = float(_np.linalg.norm(pitch_canon_local))
+        if norm > 1e-6:
+            pitch_canon_local = pitch_canon_local / norm
+        else:
+            pitch_canon_local = _np.array([1.0, 0.0, 0.0])
+            if side == "left":
+                pitch_canon_local = -pitch_canon_local
+    else:
+        pitch_canon_local = _np.array([1.0, 0.0, 0.0])
+        if side == "left":
+            pitch_canon_local = -pitch_canon_local
+
+    # Roll canonical: no per-arm capture step, so always analytical default.
+    roll_canon_local = _np.array([0.0, 0.0, -1.0])
+    if side == "left":
+        roll_canon_local = -roll_canon_local
+
+    pitch_robot = M @ pitch_canon_local
+    roll_robot  = M @ roll_canon_local
+    pitch_obs_sign = 1.0 if float(pitch_robot[1]) >= 0.0 else -1.0
+    roll_obs_sign  = 1.0 if float(roll_robot[0])  >= 0.0 else -1.0
+    # Choose runtime sign so wrist_flex_delta = polarity['flex'] * |…| (i.e., the
+    # motor delta's sign matches polarity for the canonical motion).
+    flex_pol = 1.0 if float(polarity.get("flex", -1.0)) >= 0.0 else -1.0
+    roll_pol = 1.0 if float(polarity.get("roll", -1.0)) >= 0.0 else -1.0
+    wrist_flex_sign = flex_pol / pitch_obs_sign
+    wrist_roll_sign = roll_pol / roll_obs_sign
+    return (1.0 if wrist_flex_sign >= 0.0 else -1.0,
+            1.0 if wrist_roll_sign >= 0.0 else -1.0)
+
+
 def _clamp_to_workspace_reach(position: _np.ndarray) -> _np.ndarray:
     """Keep the requested EE target inside the robot-base reach sphere."""
     radius = float(_np.linalg.norm(position))
@@ -406,6 +518,10 @@ def _compute_session_frame_from_two_motions(
     Cosine threshold: 0.6 (≈ 53° between vectors). Below that, the
     Gram-Schmidt orthogonalization throws away too much information from the
     user's motion intent.
+
+    Kept around as a fallback for the rare case where the wizard's 3rd ("left")
+    motion is missing/degenerate — `_compute_session_frame_from_three_motions`
+    is the preferred path.
     """
     f = _np.array(motion_fwd_vr, dtype=float)
     u = _np.array(motion_up_vr, dtype=float)
@@ -439,6 +555,102 @@ def _compute_session_frame_from_two_motions(
     right_axis /= float(_np.linalg.norm(right_axis))
 
     return _np.stack([fwd_axis, right_axis, up_axis], axis=0), confidence
+
+
+def _compute_session_frame_from_three_motions(
+    motion_fwd_vr: tuple[float, float, float],
+    motion_up_vr: tuple[float, float, float],
+    motion_left_vr: tuple[float, float, float],
+) -> tuple[_np.ndarray, str]:
+    """Build the session VR→robot rotation matrix from all three USER-MOTION
+    vectors via constrained least-squares (Kabsch / Procrustes).
+
+    The user moved their hand FORWARD, UP, and to-their-LEFT (in their body
+    frame). We want a rotation matrix M ∈ SO(3) such that:
+
+        M @ motion_fwd_vr  ≈ +robot_x  (forward away from arm)
+        M @ motion_up_vr   ≈ +robot_z  (vertical up)
+        M @ motion_left_vr ≈ +robot_y  (robot's left)
+
+    Three motion vectors give 9 equations for SO(3)'s 3 DoFs — overdetermined.
+    The Kabsch solution finds the closest rotation matrix in least-squares
+    sense, averaging out any single-motion noise (off-axis drift, jitter in a
+    hand-held motion). Much more robust than the 2-motion Gram-Schmidt path,
+    which can be perturbed by any small noise on the up-motion vector.
+
+    Confidence:
+      - "good"  if all three motions are well separated AND the residual
+                fit error is small.
+      - "poor"  if any pair is too parallel (cos > 0.6) OR the residual is large.
+
+    Falls back to the 2-motion path if the left motion is degenerate (too
+    small or perfectly aligned with the existing axes).
+    """
+    f = _np.array(motion_fwd_vr,  dtype=float)
+    u = _np.array(motion_up_vr,   dtype=float)
+    l = _np.array(motion_left_vr, dtype=float)
+    fn = float(_np.linalg.norm(f))
+    un = float(_np.linalg.norm(u))
+    ln = float(_np.linalg.norm(l))
+    if fn < 1e-3 or un < 1e-3 or ln < 1e-3:
+        log.warning(
+            "3-motion calibration has a degenerate vector (|fwd|=%.3f, |up|=%.3f, "
+            "|left|=%.3f); falling back to 2-motion build",
+            fn, un, ln,
+        )
+        return _compute_session_frame_from_two_motions(motion_fwd_vr, motion_up_vr)
+
+    f_hat = f / fn
+    u_hat = u / un
+    l_hat = l / ln
+
+    # Pairwise separation check (degrees apart).
+    cos_fu = abs(float(_np.dot(f_hat, u_hat)))
+    cos_fl = abs(float(_np.dot(f_hat, l_hat)))
+    cos_ul = abs(float(_np.dot(u_hat, l_hat)))
+    cos_max = max(cos_fu, cos_fl, cos_ul)
+    confidence = "good"
+    if cos_max > 0.6:
+        confidence = "poor"
+        log.warning(
+            "3-motion calibration: motions too parallel (max cos=%.2f, ≈%.1f° apart); "
+            "matrix confidence POOR. Re-run wizard with more orthogonal motions.",
+            cos_max, math.degrees(math.acos(min(1.0, cos_max))),
+        )
+
+    # Procrustes: minimize ||M A - B||_F over M ∈ SO(3).
+    #   A's columns are the normalized VR motions.
+    #   B's columns are the target robot-frame unit axes.
+    A = _np.stack([f_hat, u_hat, l_hat], axis=1)
+    B = _np.stack([
+        _np.array([1.0, 0.0, 0.0]),  # +x_robot ← fwd
+        _np.array([0.0, 0.0, 1.0]),  # +z_robot ← up
+        _np.array([0.0, 1.0, 0.0]),  # +y_robot ← left
+    ], axis=1)
+
+    H = B @ A.T
+    U_, _S, Vt = _np.linalg.svd(H)
+    D = _np.eye(3)
+    if _np.linalg.det(U_ @ Vt) < 0:
+        D[-1, -1] = -1.0
+    M = U_ @ D @ Vt
+
+    # Residual fit error: how far is M from a perfect mapping of all three?
+    residual = float(_np.linalg.norm(M @ A - B, ord="fro"))
+    if residual > 0.5 and confidence == "good":
+        confidence = "poor"
+        log.warning(
+            "3-motion calibration: large residual fit error (%.3f); "
+            "user motions disagree about the frame. Confidence POOR.",
+            residual,
+        )
+    else:
+        log.info(
+            "3-motion calibration: residual fit error %.3f (max cos %.2f); confidence %s",
+            residual, cos_max, confidence,
+        )
+
+    return M, confidence
 
 
 def _compute_session_frame_from_motion(motion_vr: tuple[float, float, float]) -> _np.ndarray:
@@ -736,7 +948,20 @@ class _PerArm:
     cal_captured_fwd:  Optional[tuple[float, float, float]] = None
     cal_captured_up:   Optional[tuple[float, float, float]] = None
     cal_captured_left: Optional[tuple[float, float, float]] = None
-    cal_rot_acc: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Wrist-verify step 4: controller quaternion captured at grip-press, used
+    # to compute the delta rotation at grip-release.
+    cal_anchor_quat_for_wrist: Optional[tuple[float, float, float, float]] = None
+    # Latest release quaternion latched from the last POSITION goal while in
+    # motioning_wrist_verify (fallback when IDLE goal omits rotation).
+    cal_wrist_release_quat: Optional[tuple[float, float, float, float]] = None
+    # Live wrist rotation since the step-4 anchor (degrees) — for wizard UI.
+    cal_wrist_verify_deg: float = 0.0
+    # Per-arm anchor-local rotvec (unit vector) the user's wrist rotates around
+    # when pitching UP. SIDE HANDEDNESS ALREADY APPLIED — fed directly to M in
+    # `_derive_wrist_signs_from_session`. None = use the WebXR analytical
+    # default (±x_anchor_local depending on side). Captured by the wrist-verify
+    # wizard step; persisted in `vr_calibration.yaml` as `wrist_pitch_anchor_local`.
+    wrist_pitch_canonical: Optional[tuple[float, float, float]] = None
     # Last completion-time motion magnitudes (m) — for UI to show "calibrated to N cm"
     cal_last_fwd_m:  float = 0.0
     cal_last_up_m:   float = 0.0
@@ -761,7 +986,6 @@ class _PerArm:
     invert_lateral_override: bool = False
     wrist_flex_sign: float = 1.0
     wrist_roll_sign: float = -1.0
-    wrist_sign_override: bool = False
     # Per-arm URDF kinematics + last-good IK solution. Built lazily on first
     # RESET (see _ensure_kinematics). The IK uses `last_q_sol` as the initial
     # guess on every subsequent tick — this is the key trick that kills
@@ -851,11 +1075,12 @@ class VRTeleopSession:
         file exists or the file is malformed. Also reads per-arm invert_lateral
         flags from config/xlerobot.yaml's `vr:` section, both the value AND
         whether it's explicitly set (override mode). Also reads the global
-        smoothing and rate-limit factors."""
+        smoothing and rate-limit factors, plus the hardware
+        `vr.wrist_motor_polarity` block (per-arm motor polarity used to derive
+        runtime wrist signs)."""
         import yaml
         global KP, WRIST_RAD_DELTA_LIMIT
         global POS_EMA_ALPHA, ORI_EMA_ALPHA
-        global WRIST_FLEX_SIGN, WRIST_ROLL_SIGN
         try:
             cfg = yaml.safe_load((REPO_ROOT / "config" / "xlerobot.yaml").read_text()) or {}
             vr_section = cfg.get("vr") or {}
@@ -878,18 +1103,37 @@ class VRTeleopSession:
                 for joint, cap in joint_caps.items():
                     if joint in PER_TICK_DEG_CAPS:
                         PER_TICK_DEG_CAPS[joint] = max(0.1, min(30.0, float(cap)))
-            WRIST_FLEX_SIGN = (
-                -1.0 if _float_key("wrist_flex_sign", WRIST_FLEX_SIGN, -1.0, 1.0) < 0 else 1.0
-            )
-            WRIST_ROLL_SIGN = (
-                -1.0 if _float_key("wrist_roll_sign", WRIST_ROLL_SIGN, -1.0, 1.0) < 0 else 1.0
-            )
+            # Per-arm hardware motor polarity (NOT the runtime signs — those are
+            # derived from polarity × session matrix at restore time). Anything
+            # missing falls back to the defaults in _WRIST_MOTOR_POLARITY.
+            polarity_block = vr_section.get("wrist_motor_polarity") or {}
+            if isinstance(polarity_block, dict):
+                for side in ("left", "right"):
+                    arm_block = polarity_block.get(side) or {}
+                    if not isinstance(arm_block, dict):
+                        continue
+                    for axis in ("flex", "roll"):
+                        if axis not in arm_block:
+                            continue
+                        try:
+                            raw = float(arm_block[axis])
+                        except (TypeError, ValueError):
+                            log.warning(
+                                "vr.wrist_motor_polarity.%s.%s is not numeric (%r); "
+                                "keeping default %+.0f",
+                                side, axis, arm_block[axis],
+                                _WRIST_MOTOR_POLARITY[side][axis],
+                            )
+                            continue
+                        _WRIST_MOTOR_POLARITY[side][axis] = 1.0 if raw >= 0 else -1.0
             log.info(
                 "VR smoothing loaded: kp=%.2f pos_ema=%.2f ori_ema=%.2f "
-                "wrist_cap=%.1f° wrist_signs=(flex %.0f, roll %.0f)",
+                "wrist_cap=%.1f° wrist_motor_polarity(left)=(flex %+.0f, roll %+.0f) "
+                "wrist_motor_polarity(right)=(flex %+.0f, roll %+.0f)",
                 KP, POS_EMA_ALPHA, ORI_EMA_ALPHA,
                 math.degrees(WRIST_RAD_DELTA_LIMIT),
-                WRIST_FLEX_SIGN, WRIST_ROLL_SIGN,
+                _WRIST_MOTOR_POLARITY["left"]["flex"], _WRIST_MOTOR_POLARITY["left"]["roll"],
+                _WRIST_MOTOR_POLARITY["right"]["flex"], _WRIST_MOTOR_POLARITY["right"]["roll"],
             )
         except Exception as e:
             log.warning("could not read VR smoothing config from YAML: %s", e)
@@ -897,7 +1141,17 @@ class VRTeleopSession:
             self._restore_persisted_arm_config(side)
 
     def _restore_persisted_arm_config(self, side: ArmSide) -> None:
-        """Restore saved calibration and lateral mapping for a freshly reset arm."""
+        """Restore saved calibration and lateral mapping for a freshly reset arm.
+
+        Runtime `wrist_flex_sign` / `wrist_roll_sign` are derived from the
+        saved session_vr_to_robot matrix combined with the hardware motor
+        polarity (`vr.wrist_motor_polarity`). They are intentionally NOT read
+        from `vr_calibration.yaml` — the wizard never writes them, and pinning
+        them as YAML constants doesn't survive recalibrating from a different
+        orientation (the M matrix's first column flips, and the canonical
+        controller motion lands on the opposite robot-frame axis). Deriving
+        them per-session is what keeps the wrist tracking the user invariant.
+        """
         invert_flags = _vrcal.read_invert_lateral_flags()
         overrides = _vrcal.read_invert_lateral_overrides()
         arm = self._arms[side]
@@ -911,16 +1165,41 @@ class VRTeleopSession:
         arm.cal_last_fwd_m = float(data.get("forward_motion_m", 0.0))
         arm.cal_last_up_m = float(data.get("up_motion_m", 0.0))
         arm.cal_last_left_m = float(data.get("left_motion_m", 0.0))
-        arm.wrist_flex_sign = 1.0 if float(data.get("wrist_flex_sign", WRIST_FLEX_SIGN)) >= 0 else -1.0
-        arm.wrist_roll_sign = 1.0 if float(data.get("wrist_roll_sign", WRIST_ROLL_SIGN)) >= 0 else -1.0
+        polarity = _WRIST_MOTOR_POLARITY.get(side, {"flex": -1.0, "roll": -1.0})
+        # Empirical wrist pitch canonical (anchor-local rotvec, side-handedness
+        # already applied), captured by the optional wrist-verify wizard step.
+        # Absent → use the WebXR analytical default.
+        saved_canonical = data.get("wrist_pitch_anchor_local")
+        if (isinstance(saved_canonical, (list, tuple))
+                and len(saved_canonical) == 3
+                and all(isinstance(v, (int, float)) for v in saved_canonical)):
+            arm.wrist_pitch_canonical = (float(saved_canonical[0]),
+                                          float(saved_canonical[1]),
+                                          float(saved_canonical[2]))
+        else:
+            arm.wrist_pitch_canonical = None
         M = _vrcal.matrix_for_arm(side)
         if M is None:
+            # No calibration on disk yet — fall back to the identity-mapping
+            # default session matrix (already set on `arm`) so the derived
+            # signs are at least self-consistent until the user calibrates.
+            arm.wrist_flex_sign, arm.wrist_roll_sign = _derive_wrist_signs_from_session(
+                side, arm.session_vr_to_robot, polarity,
+                pitch_canonical=arm.wrist_pitch_canonical,
+            )
             return
         arm.session_vr_to_robot = M
+        arm.wrist_flex_sign, arm.wrist_roll_sign = _derive_wrist_signs_from_session(
+            side, M, polarity, pitch_canonical=arm.wrist_pitch_canonical,
+        )
+        canon_label = "empirical" if arm.wrist_pitch_canonical is not None else "analytical"
         log.info(
-            "[%s] restored saved VR calibration (invert_lateral=%s, override=%s, confidence=%s, wrist_signs=(%.0f, %.0f))",
+            "[%s] restored saved VR calibration (invert_lateral=%s, override=%s, "
+            "confidence=%s, derived wrist_signs=(flex %+.0f, roll %+.0f) "
+            "from polarity=(flex %+.0f, roll %+.0f), pitch canonical=%s)",
             side, arm.invert_lateral, arm.invert_lateral_override,
             arm.cal_confidence, arm.wrist_flex_sign, arm.wrist_roll_sign,
+            polarity["flex"], polarity["roll"], canon_label,
         )
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -1152,6 +1431,14 @@ class VRTeleopSession:
                         "wizard_fwd_captured":  arm.cal_captured_fwd  is not None,
                         "wizard_up_captured":   arm.cal_captured_up   is not None,
                         "wizard_left_captured": arm.cal_captured_left is not None,
+                        "wizard_wrist_verify_deg": arm.cal_wrist_verify_deg,
+                        "wizard_wrist_verify_target_deg": WRIST_VERIFY_TARGET_DEG,
+                        "wizard_wrist_verify_min_deg": WRIST_VERIFY_MIN_DEG,
+                        "wizard_wrist_captured": arm.wrist_pitch_canonical is not None,
+                        "wrist_pitch_canonical": (
+                            list(arm.wrist_pitch_canonical)
+                            if arm.wrist_pitch_canonical is not None else None
+                        ),
                         "invert_lateral":       arm.invert_lateral,
                         "confidence":           arm.cal_confidence,
                         "wrist_flex_sign":      arm.wrist_flex_sign,
@@ -1870,9 +2157,7 @@ class VRTeleopSession:
           idle → awaiting_anchor_fwd  → motioning_fwd
                → awaiting_anchor_up   → motioning_up
                → awaiting_anchor_left → motioning_left
-               → awaiting_anchor_wrist_pitch → motioning_wrist_pitch
-               → awaiting_anchor_wrist_roll  → motioning_wrist_roll
-               → idle (matrix, lateral, and wrist signs verified)
+               → idle (matrix + lateral verified)
 
         Steps:
           1 (forward): user moves hand in their forward direction → captures
@@ -1884,8 +2169,14 @@ class VRTeleopSession:
             is NEGATIVE (i.e., motion ended up on robot's right despite user
             moving left), `invert_lateral` gets set to True. Catches motor
             sign-convention mismatches that the forward+up math alone misses.
-          4 (wrist pitch): user pitches wrist upward → captures wrist_flex sign.
-          5 (wrist roll):  user rolls wrist → captures wrist_roll sign.
+
+        Runtime wrist signs (wrist_flex_sign / wrist_roll_sign) are NOT part of
+        this wizard — they are derived per session from the session matrix
+        combined with the hardware motor polarity in
+        `config/xlerobot.yaml` under `vr.wrist_motor_polarity.{left,right}.{flex,roll}`.
+        Flip polarity there if you rewire/remount a wrist motor; recalibrating
+        translation here is enough to keep the wrist tracking the user even
+        when you face a different direction.
 
         While calibration is active, the arm is force-unengaged so the robot
         doesn't drive during motion capture.
@@ -1904,7 +2195,13 @@ class VRTeleopSession:
             arm.cal_captured_fwd  = None
             arm.cal_captured_up   = None
             arm.cal_captured_left = None
-            arm.cal_rot_acc = (0.0, 0.0, 0.0)
+            arm.cal_anchor_quat_for_wrist = None
+            arm.cal_wrist_release_quat = None
+            arm.cal_wrist_verify_deg = 0.0
+            # Discard any prior empirical wrist pitch canonical — the user
+            # is re-running the wizard. They can either re-capture in step 4
+            # or press 'Skip wrist verify' to fall back to the WebXR default.
+            arm.wrist_pitch_canonical = None
             arm.cal_validation = {}
             arm.cal_last_fwd_m  = 0.0
             arm.cal_last_up_m   = 0.0
@@ -1921,11 +2218,15 @@ class VRTeleopSession:
             log.info("[%s] calibration cancelled", side)
             arm.cal_state = "idle"
             arm.cal_motion_acc = (0.0, 0.0, 0.0)
-            arm.cal_rot_acc = (0.0, 0.0, 0.0)
             arm.cal_captured_fwd = None
             arm.cal_captured_up = None
             arm.cal_captured_left = None
+            arm.cal_anchor_quat_for_wrist = None
+            arm.cal_wrist_release_quat = None
+            arm.cal_wrist_verify_deg = 0.0
             arm.cal_validation = {}
+            # Restore everything (matrix, lateral, polarity-derived signs, and
+            # any persisted empirical wrist canonical) from disk.
             self._restore_persisted_arm_config(side)
             return self.status()
 
@@ -2080,14 +2381,25 @@ class VRTeleopSession:
                 arm.cal_state = "motioning_left"
                 log.info("[%s] cal: anchor for left captured; "
                          "move hand LEFT ~10 cm, then release grip", side)
-            elif state == "awaiting_anchor_wrist_pitch":
-                arm.cal_rot_acc = (0.0, 0.0, 0.0)
-                arm.cal_state = "motioning_wrist_pitch"
-                log.info("[%s] cal: wrist pitch anchor captured; pitch wrist UP, then release grip", side)
-            elif state == "awaiting_anchor_wrist_roll":
-                arm.cal_rot_acc = (0.0, 0.0, 0.0)
-                arm.cal_state = "motioning_wrist_roll"
-                log.info("[%s] cal: wrist roll anchor captured; roll wrist clockwise/right, then release grip", side)
+            elif state == "awaiting_anchor_wrist_verify":
+                anchor_q = goal.rotation_quat
+                if anchor_q is None:
+                    log.warning(
+                        "[%s] cal: wrist-verify reset has no controller quaternion; "
+                        "release grip and try again (or press 'Skip wrist verify')",
+                        side,
+                    )
+                    return
+                arm.cal_anchor_quat_for_wrist = anchor_q
+                arm.cal_wrist_release_quat = None
+                arm.cal_wrist_verify_deg = 0.0
+                arm.cal_state = "motioning_wrist_verify"
+                log.info(
+                    "[%s] cal: wrist-verify anchor captured. KEEP GRIP HELD and pitch "
+                    "your wrist clearly UP (rotate palm toward ceiling) ~20-45°, "
+                    "then release. Or press 'Skip wrist verify' to use the WebXR default.",
+                    side,
+                )
             return
         # Accumulate per-frame position deltas while moving.
         if mode == "position" and state in (
@@ -2099,14 +2411,15 @@ class VRTeleopSession:
                 arm.cal_motion_acc[2] + float(dp[2]),
             )
             return
-        if mode == "position" and state in (
-                "motioning_wrist_pitch", "motioning_wrist_roll"):
-            dr = goal.rel_rotvec
-            arm.cal_rot_acc = (
-                arm.cal_rot_acc[0] + float(dr[0]),
-                arm.cal_rot_acc[1] + float(dr[1]),
-                arm.cal_rot_acc[2] + float(dr[2]),
-            )
+        if mode == "position" and state == "motioning_wrist_verify":
+            release_q = goal.rotation_quat
+            anchor_q = arm.cal_anchor_quat_for_wrist
+            if release_q is not None:
+                arm.cal_wrist_release_quat = release_q
+            if anchor_q is not None and release_q is not None:
+                arm.cal_wrist_verify_deg = _wrist_rotation_deg_since_anchor(
+                    anchor_q, release_q,
+                )
             return
         # Grip-release transitions (IDLE goal)
         if mode == "idle":
@@ -2133,7 +2446,11 @@ class VRTeleopSession:
                     return
                 arm.cal_captured_up = arm.cal_motion_acc
                 arm.cal_last_up_m = mag
-                # Build the matrix NOW so step 3 (left-motion check) can use it.
+                # Build a preliminary 2-motion matrix so the UI's diagnostics
+                # (and the upcoming lateral-check arrow if anyone looks at it)
+                # have something sensible to show. The FINAL matrix is rebuilt
+                # in _finalize_translation_calibration from all three motions
+                # via Procrustes for better noise rejection.
                 f = arm.cal_captured_fwd
                 u = arm.cal_captured_up
                 if f is not None and u is not None:
@@ -2141,9 +2458,10 @@ class VRTeleopSession:
                         _compute_session_frame_from_two_motions(f, u)
                     )
                 arm.cal_state = "awaiting_anchor_left"
-                log.info("[%s] cal: up axis captured (%.1f cm); matrix built. "
-                         "Now press grip and move hand LEFT ~10 cm — we'll use "
-                         "this to verify the lateral axis sign.", side, mag * 100)
+                log.info("[%s] cal: up axis captured (%.1f cm); preliminary matrix built. "
+                         "Now press grip and move hand LEFT ~10 cm — the final matrix "
+                         "is built from all three motions when this completes.",
+                         side, mag * 100)
             elif state == "motioning_left":
                 mag = math.sqrt(sum(v * v for v in arm.cal_motion_acc))
                 if mag < CALIBRATION_MIN_MOTION_M:
@@ -2154,14 +2472,13 @@ class VRTeleopSession:
                 arm.cal_captured_left = arm.cal_motion_acc
                 arm.cal_last_left_m = mag
                 self._finalize_translation_calibration(side)
-            elif state == "motioning_wrist_pitch":
-                self._capture_wrist_sign(side, axis="pitch")
-            elif state == "motioning_wrist_roll":
-                self._capture_wrist_sign(side, axis="roll")
+            elif state == "motioning_wrist_verify":
+                self._finalize_wrist_verify(side, goal)
 
     def _finalize_translation_calibration(self, side: ArmSide) -> None:
-        """Verify the lateral axis sign using the third captured motion, then
-        finish calibration. Called WITH `self._lock` held."""
+        """Rebuild the session matrix from all three captured motions via
+        Procrustes/Kabsch, verify the lateral axis sign, then transition to the
+        wrist-verify step. Called WITH `self._lock` held."""
         arm = self._arms[side]
         f = arm.cal_captured_fwd
         u = arm.cal_captured_up
@@ -2170,17 +2487,14 @@ class VRTeleopSession:
             log.warning("[%s] cal: finalize called without all three vectors", side)
             arm.cal_state = "idle"
             return
-        # Additional orthogonality check between forward and left motions.
-        # If too parallel (cos > 0.6), downgrade confidence — even if fwd/up
-        # were well-separated, a poor left-motion can give a brittle sign.
-        f_arr = _np.array(f, dtype=float); l_arr = _np.array(l, dtype=float)
-        f_n = float(_np.linalg.norm(f_arr)); l_n = float(_np.linalg.norm(l_arr))
-        if f_n > 1e-3 and l_n > 1e-3:
-            cos_fl = abs(float(_np.dot(f_arr, l_arr) / (f_n * l_n)))
-            if cos_fl > 0.6:
-                arm.cal_confidence = "poor"
-                log.warning("[%s] forward and left motions too parallel "
-                            "(cos=%.2f); confidence POOR", side, cos_fl)
+
+        # Rebuild M using ALL three captured motions. This averages out noise
+        # in any single motion (small off-axis drift, hand jitter) far better
+        # than the 2-motion Gram-Schmidt path. Falls back to the 2-motion
+        # build internally if one motion is degenerate.
+        arm.session_vr_to_robot, arm.cal_confidence = (
+            _compute_session_frame_from_three_motions(f, u, l)
+        )
 
         # Verify lateral: transform the captured left-motion through M to robot
         # frame. y > 0 = "user-left → robot-left" (correct, no invert).
@@ -2206,10 +2520,10 @@ class VRTeleopSession:
             "lateral_verdict": verdict,
         }
         log.info(
-            "[%s] translation calibration validated — forward=%s up=%s left=%s; "
-            "robot deltas fwd=%s up=%s left=%s → lateral %s\n"
-            "session matrix:\n%s\nNext: press grip, pitch wrist UP, then release.",
-            side,
+            "[%s] translation calibration finalized (Procrustes M, conf=%s) — "
+            "forward=%s up=%s left=%s → robot deltas fwd=%s up=%s left=%s → lateral %s\n"
+            "session matrix:\n%s",
+            side, arm.cal_confidence,
             tuple(f"{v:.3f}" for v in f),
             tuple(f"{v:.3f}" for v in u),
             tuple(f"{v:.3f}" for v in l),
@@ -2219,41 +2533,132 @@ class VRTeleopSession:
             verdict,
             arm.session_vr_to_robot.round(3),
         )
-        arm.cal_state = "awaiting_anchor_wrist_pitch"
 
-    def _capture_wrist_sign(self, side: ArmSide, axis: str) -> None:
-        """Capture per-arm wrist signs from non-driving calibration motions."""
+        # Hand off to wrist-verify step. The user can either do one clean
+        # pitch-up motion to capture the empirical canonical (most robust),
+        # or skip via the UI button (analytical canonical from WebXR is then
+        # used; works for standard Quest controllers).
+        arm.cal_anchor_quat_for_wrist = None
+        arm.cal_state = "awaiting_anchor_wrist_verify"
+        log.info(
+            "[%s] Translation done. Next (OPTIONAL): squeeze grip, pitch wrist UP "
+            "(rotate forearm so palm rotates from level → up), release. Or press "
+            "'Skip wrist verify' to finish with the WebXR analytical canonical.",
+            side,
+        )
+
+    def _finalize_wrist_verify(self, side: ArmSide, goal: _LatestGoal) -> None:
+        """Step 4 of the wizard: empirically capture the user's "pitch up" axis
+        in controller anchor-local frame, then bake it into the wrist sign
+        derivation. Called WITH `self._lock` held.
+
+        The user squeezed grip (snapshot of `arm.cal_anchor_quat_for_wrist`),
+        pitched their wrist UP, and released. We compute the relative rotation
+        of the controller from anchor to release — that vector, in anchor-local
+        frame, IS the empirical "pitch up canonical". Stored side-handedness-
+        applied, ready for direct use by `_derive_wrist_signs_from_session`.
+        """
         arm = self._arms[side]
-        rot = _np.array(arm.cal_rot_acc, dtype=float)
-        mag = float(_np.linalg.norm(rot))
-        if mag < math.radians(3.0):
-            log.warning("[%s] cal: wrist %s motion too small (%.1f°); re-grip and move further",
-                        side, axis, math.degrees(mag))
-            arm.cal_state = "awaiting_anchor_wrist_pitch" if axis == "pitch" else "awaiting_anchor_wrist_roll"
-            arm.cal_rot_acc = (0.0, 0.0, 0.0)
-            return
-        robot_rot = arm.session_vr_to_robot @ rot
-        if axis == "pitch":
-            arm.wrist_flex_sign = 1.0 if float(robot_rot[1]) >= 0.0 else -1.0
-            arm.cal_validation["wrist_pitch_robot_rotvec"] = [float(v) for v in robot_rot]
-            arm.cal_validation["wrist_flex_sign"] = arm.wrist_flex_sign
-            arm.cal_state = "awaiting_anchor_wrist_roll"
-            arm.cal_rot_acc = (0.0, 0.0, 0.0)
-            log.info(
-                "[%s] wrist pitch sign captured: %.0f (robot rotvec=%s). "
-                "Next: press grip, roll wrist clockwise/right, then release.",
-                side, arm.wrist_flex_sign, tuple(f"{v:.3f}" for v in robot_rot),
+        anchor_q = arm.cal_anchor_quat_for_wrist
+        release_q = goal.rotation_quat or arm.cal_wrist_release_quat
+        if anchor_q is None or release_q is None:
+            log.warning(
+                "[%s] cal: wrist-verify missing controller quaternion (anchor=%s, "
+                "release=%s); re-grip and pitch wrist again, or press 'Skip'.",
+                side, anchor_q is not None, release_q is not None,
             )
+            arm.cal_state = "awaiting_anchor_wrist_verify"
             return
-        arm.wrist_roll_sign = 1.0 if float(robot_rot[0]) >= 0.0 else -1.0
-        arm.cal_validation["wrist_roll_robot_rotvec"] = [float(v) for v in robot_rot]
-        arm.cal_validation["wrist_roll_sign"] = arm.wrist_roll_sign
-        arm.cal_rot_acc = (0.0, 0.0, 0.0)
+
+        R_anchor = _R.from_quat(anchor_q)
+        R_release = _R.from_quat(release_q)
+        # Relative rotation expressed in the anchor's local frame.
+        R_rel = R_anchor.inv() * R_release
+        rotvec = _np.asarray(R_rel.as_rotvec(), dtype=float)
+        mag = float(_np.linalg.norm(rotvec))
+        arm.cal_wrist_verify_deg = math.degrees(mag)
+        if mag < math.radians(WRIST_VERIFY_MIN_DEG):
+            log.warning(
+                "[%s] cal: wrist-verify motion too small (%.1f°, need ≥%.0f°). "
+                "Re-grip and pitch wrist further, or press 'Skip wrist verify' "
+                "to use the WebXR analytical default.",
+                side, math.degrees(mag), WRIST_VERIFY_MIN_DEG,
+            )
+            arm.cal_state = "awaiting_anchor_wrist_verify"
+            arm.cal_anchor_quat_for_wrist = None
+            arm.cal_wrist_release_quat = None
+            arm.cal_wrist_verify_deg = 0.0
+            return
+
+        # Apply side handedness to match `_controller_rotation_delta_for_side`
+        # at runtime (left = transpose ≈ negate-rotvec for unit-axis motions).
+        canonical = rotvec / mag
+        if side == "left":
+            canonical = -canonical
+
+        arm.wrist_pitch_canonical = tuple(float(v) for v in canonical)
+        arm.cal_validation["wrist_pitch_anchor_local"] = list(arm.wrist_pitch_canonical)
+        arm.cal_validation["wrist_verify_magnitude_deg"] = math.degrees(mag)
+
+        # Compare with the WebXR analytical default to surface any mismatch.
+        analytical = _np.array([1.0, 0.0, 0.0])  # both sides, BEFORE side flip
+        # canonical above is post-side-flip; un-apply for comparison
+        measured_pre_flip = -_np.asarray(canonical) if side == "left" else _np.asarray(canonical)
+        cos = float(_np.dot(measured_pre_flip, analytical))
+        cos_clamped = max(-1.0, min(1.0, cos))
+        off_deg = math.degrees(math.acos(cos_clamped))
+        arm.cal_validation["wrist_verify_off_from_webxr_default_deg"] = off_deg
+        if cos >= 0.85:
+            log.info(
+                "[%s] wrist-verify: empirical pitch canonical %s (anchor-local, "
+                "post-side-flip). Matches WebXR analytical default within %.0f° "
+                "→ wrist mapping confirmed.",
+                side, tuple(f"{v:+.3f}" for v in canonical), off_deg,
+            )
+        else:
+            log.warning(
+                "[%s] wrist-verify: empirical pitch canonical %s is %.0f° off from "
+                "the WebXR analytical default ([+1, 0, 0]). This means your "
+                "controller's anchor-local pitch axis is NOT what WebXR docs "
+                "suggest — the empirical value will be used at runtime and "
+                "wrist mapping will track your actual motion correctly.",
+                side, tuple(f"{v:+.3f}" for v in canonical), off_deg,
+            )
+        arm.cal_anchor_quat_for_wrist = None
+        arm.cal_wrist_release_quat = None
         self._persist_final_calibration(side)
+
+    def skip_wrist_verify(self, side: ArmSide) -> dict:
+        """Skip the optional step-4 wrist-verify motion and finish calibration
+        using the WebXR analytical canonical for the wrist pitch axis.
+
+        Safe to call any time the wizard is in the wrist-verify substep; no-op
+        otherwise. The user can always re-run the full wizard later to capture
+        an empirical canonical if wrist tracking turns out to be off."""
+        with self._lock:
+            arm = self._arms[side]
+            if arm.cal_state not in ("awaiting_anchor_wrist_verify",
+                                     "motioning_wrist_verify"):
+                return self.status()
+            log.info(
+                "[%s] wrist-verify skipped — falling back to WebXR analytical "
+                "canonical for wrist sign derivation.", side,
+            )
+            arm.wrist_pitch_canonical = None
+            arm.cal_anchor_quat_for_wrist = None
+            arm.cal_wrist_release_quat = None
+            arm.cal_wrist_verify_deg = 0.0
+            self._persist_final_calibration(side)
+        return self.status()
 
     def _persist_final_calibration(self, side: ArmSide) -> None:
         arm = self._arms[side]
         # Persist to disk so subsequent sessions don't need to re-run the wizard.
+        # Runtime `wrist_flex_sign` / `wrist_roll_sign` are NOT persisted — they
+        # are derived per session from `session_vr_to_robot` + the hardware
+        # `vr.wrist_motor_polarity` block in xlerobot.yaml. The empirical
+        # pitch canonical IS persisted when captured (overrides the WebXR
+        # default in `_derive_wrist_signs_from_session`).
         try:
             _vrcal.write_for_arm(
                 side, arm.session_vr_to_robot,
@@ -2262,18 +2667,29 @@ class VRTeleopSession:
                 left_motion_m=arm.cal_last_left_m,
                 invert_lateral=arm.invert_lateral,
                 confidence=arm.cal_confidence,
-                wrist_flex_sign=arm.wrist_flex_sign,
-                wrist_roll_sign=arm.wrist_roll_sign,
+                wrist_pitch_anchor_local=arm.wrist_pitch_canonical,
             )
         except Exception as e:
             log.warning("[%s] could not persist VR calibration: %s", side, e)
+        # The session matrix (and possibly the empirical canonical) just
+        # changed — re-derive the runtime wrist signs so the very next teleop
+        # frame uses the updated mapping.
+        polarity = _WRIST_MOTOR_POLARITY.get(side, {"flex": -1.0, "roll": -1.0})
+        arm.wrist_flex_sign, arm.wrist_roll_sign = _derive_wrist_signs_from_session(
+            side, arm.session_vr_to_robot, polarity,
+            pitch_canonical=arm.wrist_pitch_canonical,
+        )
         arm.cal_state = "idle"
         arm.cal_motion_acc = (0.0, 0.0, 0.0)
-        arm.cal_rot_acc = (0.0, 0.0, 0.0)
+        canon_label = "empirical" if arm.wrist_pitch_canonical is not None else "analytical"
         log.info(
-            "[%s] calibration COMPLETE — confidence=%s invert_lateral=%s wrist_signs=(flex %.0f, roll %.0f). "
+            "[%s] calibration COMPLETE — confidence=%s invert_lateral=%s "
+            "derived wrist_signs=(flex %+.0f, roll %+.0f) from polarity=(flex "
+            "%+.0f, roll %+.0f) using %s pitch canonical. "
             "Squeeze grip again to anchor for teleop.",
-            side, arm.cal_confidence, arm.invert_lateral, arm.wrist_flex_sign, arm.wrist_roll_sign,
+            side, arm.cal_confidence, arm.invert_lateral,
+            arm.wrist_flex_sign, arm.wrist_roll_sign,
+            polarity["flex"], polarity["roll"], canon_label,
         )
         # Note: arm.calibrated stays False — user must grip-press once more
         # to anchor for real teleop. The new session matrix will be applied

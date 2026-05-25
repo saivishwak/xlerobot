@@ -19,9 +19,16 @@ File format (`config/vr_calibration.yaml`):
       left_motion_m: 0.088
       invert_lateral: false
       confidence: good
-      wrist_flex_sign: 1.0
-      wrist_roll_sign: -1.0
     right: { ... same shape ... }
+
+Note that wrist-motor polarity is NOT a calibration output — it is a hardware
+property of how each arm's wrist motors are mounted, and lives in
+`config/xlerobot.yaml` under `vr.wrist_motor_polarity.{left,right}.{flex,roll}`.
+The runtime `wrist_flex_sign` / `wrist_roll_sign` are derived per session
+from that polarity combined with the saved `session_vr_to_robot` matrix.
+Older calibration files may still contain `wrist_flex_sign` / `wrist_roll_sign`
+keys; they are now ignored by the backend and will be dropped the next time
+this arm is recalibrated.
 
 This file is auto-managed by the calibration wizard. Sides that haven't been
 calibrated yet are simply absent. Edit by re-running the wizard, not by hand.
@@ -100,11 +107,26 @@ def write_for_arm(side: str, matrix: np.ndarray,
                    left_motion_m: float = 0.0,
                    invert_lateral: bool | None = None,
                    confidence: str = "good",
-                   wrist_flex_sign: float | None = None,
-                   wrist_roll_sign: float | None = None) -> None:
+                   wrist_pitch_anchor_local: tuple[float, float, float] | None = None,
+                   ) -> None:
     """Persist one arm's calibration. Preserves other arms' entries by reading
-    the file first, mutating, and writing back. Note: invert toggles live in
-    config/xlerobot.yaml's `vr:` section, not here."""
+    the file first, mutating, and writing back.
+
+    Notes:
+      - The `vr.invert_lateral_<side>` override toggle lives in
+        config/xlerobot.yaml's `vr:` section, not here.
+      - Wrist-motor polarity (`vr.wrist_motor_polarity` in xlerobot.yaml) is
+        hardware configuration — NOT a wizard output — so we deliberately do
+        not write the runtime `wrist_flex_sign` / `wrist_roll_sign` keys;
+        they get re-derived from polarity × session matrix at restore time.
+        Any stale entries left over from older versions of this code are
+        dropped on re-write.
+      - `wrist_pitch_anchor_local` (optional) is the empirical anchor-local
+        unit rotvec captured by the wrist-verify wizard step. SIDE HANDEDNESS
+        ALREADY APPLIED, ready for direct use in
+        `_derive_wrist_signs_from_session`. None / absent → runtime falls
+        back to the WebXR analytical canonical.
+    """
     existing = read_all()
     M = _orthonormalize_matrix(np.array(matrix, dtype=float))
     entry: dict[str, Any] = {
@@ -117,15 +139,14 @@ def write_for_arm(side: str, matrix: np.ndarray,
     }
     if invert_lateral is not None:
         entry["invert_lateral"] = bool(invert_lateral)
-    if wrist_flex_sign is not None:
-        entry["wrist_flex_sign"] = 1.0 if float(wrist_flex_sign) >= 0 else -1.0
-    if wrist_roll_sign is not None:
-        entry["wrist_roll_sign"] = 1.0 if float(wrist_roll_sign) >= 0 else -1.0
+    if wrist_pitch_anchor_local is not None:
+        entry["wrist_pitch_anchor_local"] = [float(v) for v in wrist_pitch_anchor_local]
     existing[side] = entry
     CFG_PATH.parent.mkdir(parents=True, exist_ok=True)
     header = (
         "# VR→robot calibration data. Auto-managed by the calibration wizard in\n"
         "# the webapp — edit by re-running the wizard, not by hand.\n"
+        "# Wrist-motor polarity lives in config/xlerobot.yaml (vr.wrist_motor_polarity).\n"
     )
     body = yaml.safe_dump(existing, sort_keys=False, default_flow_style=None)
     CFG_PATH.write_text(header + body)
@@ -133,7 +154,11 @@ def write_for_arm(side: str, matrix: np.ndarray,
 
 
 def status() -> dict[str, dict[str, Any]]:
-    """Status dict for the UI — per side, indicates whether saved + when."""
+    """Status dict for the UI — per side, indicates whether saved + when.
+
+    Wrist-sign keys are deliberately omitted — they live in xlerobot.yaml and
+    are surfaced separately via the per-arm runtime state (`arm.wrist_*_sign`).
+    """
     saved = read_all()
     out: dict[str, dict[str, Any]] = {}
     for side in ("left", "right"):
@@ -146,8 +171,7 @@ def status() -> dict[str, dict[str, Any]]:
             "left_motion_m": float(data.get("left_motion_m", 0.0)),
             "invert_lateral": data.get("invert_lateral"),
             "confidence": data.get("confidence", "unknown"),
-            "wrist_flex_sign": data.get("wrist_flex_sign"),
-            "wrist_roll_sign": data.get("wrist_roll_sign"),
+            "has_empirical_wrist_canonical": "wrist_pitch_anchor_local" in data,
         }
     return out
 

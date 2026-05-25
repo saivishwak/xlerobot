@@ -240,7 +240,6 @@ function EngagementCard({ s, onEngage, busy }: {
           ) : (
             <Badge color="gray" variant="light">no active arm</Badge>
           )}
-          {ageBadge(s?.last_goal_age_ms, "last VR goal ")}
           {ageBadge(s?.last_tick_age_ms, "drive tick ")}
         </Group>
 
@@ -315,11 +314,12 @@ function JointTable({ side, s }: { side: ArmSide; s: VRStatus | undefined }) {
 /** Calibration card: shows wizard state when a guided calibration is in
  *  progress, otherwise the live anchor/offset/target diagnostics + a button to
  *  start a new calibration. */
-function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
+function CalibrationCard({ side, armState, onCalibrate, onCancel, onSkipWristVerify }: {
   side: ArmSide;
   armState: VRArmState | undefined;
   onCalibrate: (arm: ArmSide) => void;
   onCancel: (arm: ArmSide) => void;
+  onSkipWristVerify: (arm: ArmSide) => void;
 }) {
   const cal = armState?.calibration;
   const connected = !!armState?.connected;
@@ -335,6 +335,13 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
     const enough = cal.wizard_motion_m >= cal.wizard_min_m;
     const fwdDone = cal.wizard_fwd_captured;
     const fwdCm = (cal.wizard_last_fwd_m * 100).toFixed(1);
+    const wristDeg = (cal.wizard_wrist_verify_deg ?? 0).toFixed(1);
+    const wristTargetDeg = String(cal.wizard_wrist_verify_target_deg ?? 20);
+    const wristMinDeg = String(cal.wizard_wrist_verify_min_deg ?? 8);
+    const wristEnough = (cal.wizard_wrist_verify_deg ?? 0) >= (cal.wizard_wrist_verify_min_deg ?? 8);
+    const wristDone = cal.wizard_wrist_captured;
+    const inWristStep = wizard.startsWith("awaiting_anchor_wrist")
+      || wizard.startsWith("motioning_wrist");
 
     return (
       <Card withBorder padding="md" style={{ borderColor: "var(--mantine-color-indigo-7)" }}>
@@ -354,9 +361,14 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
                  variant={cal.wizard_up_captured ? "filled" : "light"}>
             2. up {cal.wizard_up_captured ? `✓ ${(cal.wizard_last_up_m * 100).toFixed(1)} cm` : ""}
           </Badge>
-          <Badge size="xs" color="indigo"
-                 variant={cal.wizard_up_captured ? "filled" : "light"}>
-            3. left
+          <Badge size="xs" color={cal.wizard_left_captured ? "teal" : "indigo"}
+                 variant={cal.wizard_left_captured ? "filled" : "light"}>
+            3. left {cal.wizard_left_captured ? `✓ ${(cal.wizard_last_left_m * 100).toFixed(1)} cm` : ""}
+          </Badge>
+          <Badge size="xs"
+                 color={wristDone ? "teal" : inWristStep ? "indigo" : "gray"}
+                 variant={wristDone || inWristStep ? "filled" : "light"}>
+            4. wrist {wristDone ? "✓" : "(optional)"}
           </Badge>
         </Group>
 
@@ -469,9 +481,8 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
                 <Text fz="sm" fw={600}>Step 3 of 3 — Move LEFT</Text>
                 <Text fz="xs" mt={4}>
                   <b>Keep grip held.</b> Move your hand to YOUR LEFT (sideways)
-                  ~{target_cm} cm. Then release grip — calibration completes
-                  automatically and the invert flag is set if the lateral axis
-                  is mirrored.
+                  ~{target_cm} cm. Then release grip — translation calibration
+                  completes and the wizard moves to the optional wrist-verify step.
                 </Text>
               </Alert>
               <Group justify="space-between" mt={4}>
@@ -491,6 +502,81 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
                   { value: Number(target_cm), label: `${target_cm}` },
                 ]}
               />
+            </>
+          )}
+
+          {/* STEP 4: wrist verify — OPTIONAL. Empirically captures the
+              controller's "pitch up" anchor-local axis so wrist mapping is
+              self-correcting against any controller-frame mismatch. */}
+          {wizard === "awaiting_anchor_wrist_verify" && (
+            <>
+              <Alert color="indigo">
+                <Text fz="sm" fw={600}>
+                  Step 4 of 4 — Verify wrist tracking (optional)
+                </Text>
+                <Text fz="xs" mt={4}>
+                  Translation calibration is done. This last step empirically
+                  captures the axis your wrist rotates around when you pitch
+                  it UP, so the robot's wrist tracks <b>your actual motion</b>
+                  rather than assuming standard WebXR controller orientation.
+                </Text>
+                <Text fz="xs" mt={4} fw={600}>
+                  Squeeze the GRIP on the {side} controller, keep it held,
+                  pitch your wrist clearly UP (rotate forearm so palm rotates
+                  from level → ceiling) by ~20-45°, then release grip.
+                </Text>
+                <Text fz="xs" mt={4} c="dimmed">
+                  Tip: stay still otherwise — we want a pure wrist rotation,
+                  not a translation.
+                </Text>
+              </Alert>
+              <Group justify="flex-end">
+                <Button size="xs" variant="default"
+                        onClick={() => onSkipWristVerify(side)}>
+                  Skip wrist verify
+                </Button>
+              </Group>
+            </>
+          )}
+          {wizard === "motioning_wrist_verify" && (
+            <>
+              <Alert color={wristEnough ? "teal" : "indigo"}>
+                <Text fz="sm" fw={600}>Step 4 of 4 — Pitch wrist UP</Text>
+                <Text fz="xs" mt={4}>
+                  <b>Keep grip held.</b> Pitch your wrist UP by ~{wristTargetDeg}°
+                  (palm rotates toward the ceiling), then release grip. Need ≥
+                  {wristMinDeg}° of rotation for the capture to count.
+                </Text>
+                <Text fz="xs" mt={4} c="dimmed">
+                  If the captured axis matches the WebXR default, we just
+                  confirm it. If it differs, the wizard saves your actual
+                  axis and uses it on every future session.
+                </Text>
+              </Alert>
+              <Group justify="space-between" mt={4}>
+                <Text fz="sm">Wrist rotation so far</Text>
+                <Badge color={wristEnough ? "teal" : "indigo"} variant="filled">
+                  {wristDeg}°
+                </Badge>
+              </Group>
+              <Slider
+                value={cal.wizard_wrist_verify_deg ?? 0}
+                max={Math.max(cal.wizard_wrist_verify_target_deg ?? 20, 1)}
+                min={0}
+                disabled
+                color={wristEnough ? "teal" : "indigo"}
+                marks={[
+                  { value: 0, label: "0" },
+                  { value: Number(wristMinDeg), label: `min ${wristMinDeg}` },
+                  { value: Number(wristTargetDeg), label: wristTargetDeg },
+                ]}
+              />
+              <Group justify="flex-end">
+                <Button size="xs" variant="default"
+                        onClick={() => onSkipWristVerify(side)}>
+                  Skip wrist verify
+                </Button>
+              </Group>
             </>
           )}
         </Stack>
@@ -576,12 +662,19 @@ function CalibrationCard({ side, armState, onCalibrate, onCancel }: {
         </Text>
       )}
       {cal?.persisted?.saved && (
-        <Group gap={4} mt={4}>
+        <Group gap={4} mt={4} align="flex-start">
           <Badge size="xs" color="teal" variant="light">saved</Badge>
-          <Text fz="xs" c="dimmed">
+          <Text fz="xs" c="dimmed" style={{ flex: 1 }}>
             Calibration persisted to <span className="mono">config/vr_calibration.yaml</span>
             {cal.persisted.calibrated_at && ` at ${cal.persisted.calibrated_at.replace("T", " ")}`}
             . Will auto-load next session.
+            {cal.persisted.has_empirical_wrist_canonical && (
+              <> Wrist pitch axis captured empirically
+                {cal.wrist_pitch_canonical && (
+                  <> ({cal.wrist_pitch_canonical.map((v) => v.toFixed(2)).join(", ")})</>
+                )}.
+              </>
+            )}
           </Text>
         </Group>
       )}
@@ -975,6 +1068,23 @@ export function VRTeleop() {
     }
   };
 
+  const handleSkipWristVerify = async (arm: ArmSide) => {
+    try {
+      await api.vrCalibrateSkipWristVerify(arm);
+      notifications.show({
+        color: "indigo",
+        title: `Wrist-verify skipped (${arm})`,
+        message: "Calibration finished using the WebXR analytical canonical " +
+                 "for wrist pitch. If wrist tracking feels off, re-run the " +
+                 "wizard and complete step 4 instead of skipping.",
+      });
+      await mutate();
+    } catch (e) {
+      notifications.show({ color: "red", title: "Skip wrist verify failed",
+                            message: String(e) });
+    }
+  };
+
   const handleHomeCapture = async (arm: ArmSide) => {
     setBusy(true);
     try {
@@ -1105,12 +1215,14 @@ export function VRTeleop() {
           <Grid.Col span={{ base: 12, md: 6 }}>
             <CalibrationCard side="left" armState={s?.arms?.left}
                               onCalibrate={handleCalibrateStart}
-                              onCancel={handleCalibrateCancel} />
+                              onCancel={handleCalibrateCancel}
+                              onSkipWristVerify={handleSkipWristVerify} />
           </Grid.Col>
           <Grid.Col span={{ base: 12, md: 6 }}>
             <CalibrationCard side="right" armState={s?.arms?.right}
                               onCalibrate={handleCalibrateStart}
-                              onCancel={handleCalibrateCancel} />
+                              onCancel={handleCalibrateCancel}
+                              onSkipWristVerify={handleSkipWristVerify} />
           </Grid.Col>
           <Grid.Col span={{ base: 12, md: 6 }}>
             <ControllerCard side="left" armState={s?.arms?.left} />

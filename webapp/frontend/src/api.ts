@@ -47,12 +47,13 @@ export interface VRArmState {
     target_ee_pos: [number, number, number];
     /** Yaw (deg) of the active session VR→robot frame relative to default. */
     session_yaw_deg: number;
-    /** Guided 3-vector calibration wizard state. */
+    /** Guided 3-vector + optional wrist-verify calibration wizard state. */
     wizard_state:
       | "idle"
       | "awaiting_anchor_fwd"  | "motioning_fwd"
       | "awaiting_anchor_up"   | "motioning_up"
-      | "awaiting_anchor_left" | "motioning_left";
+      | "awaiting_anchor_left" | "motioning_left"
+      | "awaiting_anchor_wrist_verify" | "motioning_wrist_verify";
     /** Live motion magnitude (m) accumulated during the current motion-capture. */
     wizard_motion_m: number;
     wizard_target_m: number;
@@ -64,6 +65,13 @@ export interface VRArmState {
     wizard_fwd_captured: boolean;
     wizard_up_captured: boolean;
     wizard_left_captured: boolean;
+    /** Step 4: live wrist rotation since anchor (degrees). */
+    wizard_wrist_verify_deg: number;
+    wizard_wrist_verify_target_deg: number;
+    wizard_wrist_verify_min_deg: number;
+    wizard_wrist_captured: boolean;
+    /** Empirical pitch axis (anchor-local, side-handedness applied), if captured. */
+    wrist_pitch_canonical: [number, number, number] | null;
     /** Result of the lateral-check step. True = matrix mirroring detected,
      *  invert_lateral was auto-flipped on by the wizard. */
     invert_lateral: boolean;
@@ -78,6 +86,7 @@ export interface VRArmState {
       calibrated_at: string | null;
       forward_motion_m: number;
       up_motion_m: number;
+      has_empirical_wrist_canonical?: boolean;
     };
   };
   /** Per-arm home pose state — read from config/xlerobot.yaml + live flag. */
@@ -175,6 +184,13 @@ export const api = {
     }),
   vrCalibrateCancel: (arm: ArmSide) =>
     req<VRStatus>("/api/vr/calibrate/cancel", {
+      method: "POST", body: JSON.stringify({ arm }),
+    }),
+  /** End the wizard's optional step-4 wrist-verify motion without capturing an
+   *  empirical canonical. The runtime falls back to the WebXR analytical
+   *  canonical (works for standard Quest controllers). */
+  vrCalibrateSkipWristVerify: (arm: ArmSide) =>
+    req<VRStatus>("/api/vr/calibrate/skip_wrist_verify", {
       method: "POST", body: JSON.stringify({ arm }),
     }),
   /** Read present joints for one arm (or all connected if arm omitted) and

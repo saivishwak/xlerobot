@@ -227,6 +227,22 @@ def api_vr_calibrate_cancel():
     return jsonify(vr_mod.SESSION.cancel_calibration(arm))
 
 
+@bp.post("/api/vr/calibrate/skip_wrist_verify")
+def api_vr_calibrate_skip_wrist_verify():
+    """End the wizard's optional step-4 wrist-verify motion without capturing
+    an empirical canonical. The runtime falls back to the WebXR analytical
+    canonical for the wrist pitch axis — works for standard Quest controllers.
+
+    Body: `{arm}`. No-op if the wizard isn't currently at the wrist-verify
+    substep.
+    """
+    body = request.get_json(silent=True) or {}
+    arm = body.get("arm")
+    if arm not in ("left", "right"):
+        abort(400, "arm must be 'left' or 'right'")
+    return jsonify(vr_mod.SESSION.skip_wrist_verify(arm))
+
+
 @bp.post("/api/vr/recording")
 def api_vr_recording():
     """Body: `{enabled: bool, task?: str, root?: str}`. Mirror of the B button

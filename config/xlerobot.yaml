@@ -7,17 +7,17 @@ robot:
   max_relative_target: null
   use_degrees: true
   home_pose:
-    left_arm_shoulder_pan: 26.8571
-    left_arm_shoulder_lift: -13.0989
-    left_arm_elbow_flex: -45.0989
-    left_arm_wrist_flex: 69.4066
-    left_arm_wrist_roll: -4.7033
-    left_arm_gripper: 0.9729
-    right_arm_shoulder_pan: -34.1099
-    right_arm_shoulder_lift: -20.3516
-    right_arm_elbow_flex: -43.7802
-    right_arm_wrist_flex: 78.8571
-    right_arm_wrist_roll: 3.2088
+    left_arm_shoulder_pan: 21.6703
+    left_arm_shoulder_lift: -90.8132
+    left_arm_elbow_flex: 61.4505
+    left_arm_wrist_flex: 42.4176
+    left_arm_wrist_roll: -4.8791
+    left_arm_gripper: 0.7644
+    right_arm_shoulder_pan: -35.6044
+    right_arm_shoulder_lift: -91.7363
+    right_arm_elbow_flex: 57.8462
+    right_arm_wrist_flex: 56.8791
+    right_arm_wrist_roll: 9.2747
     right_arm_gripper: 0.6241
 cameras:
   left_wrist:
@@ -36,7 +36,7 @@ cameras:
     fourcc: MJPG
   head:
     type: opencv
-    path: /dev/v4l/by-path/pci-0000:11:00.4-usb-0:1:1.0-video-index0
+    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:3:1.0-video-index0
     fps: 30
     width: 640
     height: 480
@@ -55,26 +55,29 @@ vr:
   host_ip: 0.0.0.0
   https_port: 5443
   websocket_port: 5442
-  # Lateral-mirror flag per arm.
-  #
-  #   KEY ABSENT  → calibration wizard's step-3 lateral check decides each run
-  #                 (default — works for most setups).
-  #   true        → MANUAL OVERRIDE: always flip lateral on this arm, the
-  #                 wizard's auto-decision is ignored. Use this for arms with
-  #                 physically-mirrored motor mounting that the math can't see.
-  #   false       → MANUAL OVERRIDE: never flip on this arm.
-  #
-  # Uncomment one of the lines below to manually override. With both commented,
-  # the wizard handles each side automatically.
-  # invert_lateral_left:  true
-  # invert_lateral_right: true
-  # Smooth VR control. 1.0 = raw input, lower = smoother with more lag.
   kp: 1.0
   wrist_delta_limit_deg: 5.0
   pos_ema_alpha: 0.5
   ori_ema_alpha: 0.4
-  wrist_flex_sign: 1
-  wrist_roll_sign: -1
+  # Hardware polarity of the wrist motors, per arm. These answer
+  # "if the user pitches their controller +1 unit around its anchor-local x-axis
+  # and the resulting robot-frame y-component of the rotation comes out
+  # positive, does the wrist_flex motor want a positive or a negative delta to
+  # follow that motion?" That depends ONLY on how the motors are mounted and
+  # wired on each arm; it does not depend on where the user stood at
+  # calibration time. Defaults (-1 for all four) match the standard XLeRobot
+  # SO101 build. Only flip a sign here if you actually rewire or remount a
+  # wrist motor. The runtime `wrist_flex_sign` / `wrist_roll_sign` are derived
+  # from these polarities combined with the session_vr_to_robot matrix, so the
+  # wrist tracks the user even when they recalibrate facing a different
+  # direction.
+  wrist_motor_polarity:
+    left:
+      flex: -1
+      roll: -1
+    right:
+      flex: -1
+      roll: -1
   joint_deg_caps:
     shoulder_pan: 5.0
     shoulder_lift: 5.0
@@ -82,8 +85,6 @@ vr:
     wrist_flex: 6.0
     wrist_roll: 6.0
     gripper: 15.0
-  # Backward-compatible alias still accepted by the backend:
-  # rotvec_ema_alpha: 0.6
 gripper:
   open_value: 0
   closed_value: 100
