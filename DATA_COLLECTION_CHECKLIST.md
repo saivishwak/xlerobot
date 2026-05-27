@@ -97,3 +97,13 @@ If an episode fails one or more gates:
 ---
 
 If grasp remains unreliable after +40 clean episodes, prioritize additional grasp-centric episodes over adding more placement-only trajectories.
+
+
+
+## Current Progress
+
+| Label | Episodes |
+|-------|----------|
+| Pick up the medicine and place it in the bowl | 0-14 |
+| Pick up the medicine | 15-34, 45-49 |
+| Pick up the medicine and place in the bowl | 35-44 |

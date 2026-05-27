@@ -76,18 +76,30 @@ uv run python scripts/infer_pi05_finetuned.py \
 
 Homing reads **joint positions only** (no cameras). Expect warnings about pruned base/head motors on SO-101 setups.
 
-## Run inference
+## Run inference (balanced, recommended)
+
+Validated on-robot for bimanual medicine→bowl. Defaults balance **reaching the target** vs **smooth motion**: VR rate limits (matching the dataset), policy EMA before shaping, moderate command EMA / deadband, 35-step open-loop chunks, and **no** present-based `max_relative_target` clamp (`Clamp to present: False` in the startup banner).
 
 ```bash
 uv run python scripts/infer_pi05_finetuned.py \
   --policy-path outputs/pi05_finetune/checkpoints/last/pretrained_model \
   --task "Pick up the medicine and place it in the bowl" \
   --episodes 1 \
-  --episode-time 120 \
-  --device cuda
+  --episode-time 60 \
+  --fps 30
 ```
 
-Recommended for bimanual medicine→bowl (smoother motion, medicine-first prompt for the first ~20s):
+### Tuning reach vs jitter
+
+| Symptom | Try |
+|---------|-----|
+| Stuck at home, only small bobbing | Raise `--command-ema-alpha` (e.g. `0.26`) and/or lower `--joint-deadband-deg` (e.g. `0.65`) |
+| Reaches target but **jittery** | Lower `--command-ema-alpha` (e.g. `0.18`), raise `--joint-deadband-deg` (e.g. `0.85`), raise `--policy-ema-alpha` (e.g. `0.38`), or `--open-loop-steps 40` |
+| Snappy reach, still noisy at replans | `--replan-blend 0.15` and/or longer `--open-loop-steps` |
+
+Known snappy preset (reaches well, may jitter): `--command-ema-alpha 0.28 --joint-deadband-deg 0.6`.
+
+Optional: reach medicine before the full place-in-bowl task (first ~20s):
 
 ```bash
 uv run python scripts/infer_pi05_finetuned.py \
@@ -95,8 +107,9 @@ uv run python scripts/infer_pi05_finetuned.py \
   --phase1-task "Pick up the medicine bottle from the table. Do not go to the bowl yet." \
   --phase1-sec 20 \
   --task "Pick up the medicine and place it in the bowl" \
-  --episodes 1 --episode-time 60 --fps 30 \
-  --open-loop-steps 20 --settle-steps 60 --replan-blend 0.3
+  --episodes 1 \
+  --episode-time 60 \
+  --fps 30
 ```
 
 ### Control loop
@@ -125,13 +138,15 @@ uv run python scripts/infer_pi05_finetuned.py \
 | `--device` | `cuda` | `cuda`, `cpu`, or `mps` |
 | `--fps` | yaml | Control loop rate |
 | `--action-horizon` | yaml `pi05.action_horizon` | Max policy chunk size |
-| `--open-loop-steps` | `20` | Steps per chunk before re-inferring (higher = smoother; very low values jitter) |
+| `--open-loop-steps` | `35` | Steps per chunk before re-inferring (higher = smoother; very low values jitter) |
 | `--settle-steps` | `60` | Hold pose after homing (~2s @ 30Hz) before policy runs |
-| `--replan-blend` | `0.35` | Smooth first action after each new chunk |
+| `--replan-blend` | `0.25` | Smooth first action after each new chunk |
 | `--phase1-task` | — | Shorter prompt for the first segment (e.g. reach medicine only) |
 | `--phase1-sec` | `0` | Seconds to use `--phase1-task` before `--task` |
-| `--command-ema-alpha` | `0.22` | Command EMA (lower = smoother) |
-| `--joint-deadband-deg` | `0.8` | Ignore tiny command changes vs previous filtered command |
+| `--policy-ema-alpha` | `0.34` | EMA on policy targets before VR shaping |
+| `--command-ema-alpha` | `0.22` | Command EMA (lower = smoother; too low can stall at home) |
+| `--joint-deadband-deg` | `0.75` | Ignore tiny command changes vs previous filtered command |
+| `--clamp-to-present` | off | Clamp vs measured pose (`max_relative_target`); usually causes jitter |
 | `--skip-home` | off | Skip homing entirely |
 | `--home-before-episode` | yaml `dataset.home_before_episode` | Home at start of each episode |
 | `--home-timeout` | `60` | Seconds before homing gives up and continues |
@@ -156,7 +171,7 @@ Training data from the webapp uses:
 
 So each training frame’s `|action − state|` is usually **small** (≤ per-tick cap) while moving, not a 40°+ jump.
 
-`infer_pi05_finetuned.py` applies the same shaping to policy outputs before `send_action`, and uses `robot.max_relative_target` as a second safety clamp. Use **`--fps 30`** to match `dataset.fps`.
+`infer_pi05_finetuned.py` applies the same VR rate limits to policy outputs before `send_action`, then optional EMA/deadband. **Present-based** `max_relative_target` clamp is **off by default** (`--no-clamp-to-present`) because training labels are capped vs the previous command, not measured pose — enabling present clamp often causes oscillation. Use **`--fps 30`** to match `dataset.fps`.
 
 ## Configuration (`config/xlerobot.yaml`)
 
@@ -201,7 +216,8 @@ Expect weak zero-shot behavior until you finetune and use `infer_pi05_finetuned.
 | `missing camera observations` | Camera path wrong or unplugged | Fix `cameras.*.path` in yaml; check `/dev/v4l/...` |
 | CUDA OOM during **training** | Full PI0.5 finetune | Keep default `--oom-safe`; reduce batch or steps |
 | Policy moves wrong / no task following | Wrong checkpoint or no finetune | Use a finetuned `pretrained_model`, not only `pi05_base` |
-| Arms **oscillate** / jitter in place | FPS ≠ dataset, `--open-loop-steps` too low (re-plans every ~0.15s), triple clamp + EMA fighting the chunk | Use `--fps 30`, `--open-loop-steps 20` (not 5), `--replan-blend 0.3`, defaults for EMA/deadband; avoid lowering open-loop below ~15 |
+| Arms **oscillate** / jitter in place | FPS ≠ dataset, replan too often, **clamp-to-present**, or command EMA too high | Use `--fps 30`, defaults; if still jittery after reaching, lower `--command-ema-alpha` and raise `--policy-ema-alpha`; keep `--no-clamp-to-present` |
+| **Never leaves home** for a long time | Command EMA too low or deadband too high | Raise `--command-ema-alpha` (e.g. `0.26–0.28`) and/or lower `--joint-deadband-deg` (e.g. `0.6–0.65`) |
 | Robot goes to **bowl before medicine** | Single task string for whole episode; head cam may bias toward bowl; demos pause at home first | Use `--settle-steps 60`, `--phase1-task` / `--phase1-sec`; align scene with training; finetune longer |
 | `create_causal_mask() got an unexpected keyword argument 'cache_position'` | transformers 5.6+ in venv | `uv sync` (root pins `transformers<5.6`) |
 

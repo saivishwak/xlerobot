@@ -99,9 +99,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--open-loop-steps",
         type=int,
-        default=20,
+        default=35,
         help=(
-            "Policy chunk steps before re-inferring (default: 20 @ 30Hz ≈ 0.67s). "
+            "Policy chunk steps before re-inferring (default: 35 @ 30Hz ≈ 1.2s). "
             "Higher = smoother; very low values (e.g. 5) cause jitter at replan boundaries."
         ),
     )
@@ -117,7 +117,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--replan-blend",
         type=float,
-        default=0.35,
+        default=0.25,
         help=(
             "Blend factor for the first action after each new chunk [0..1]. "
             "Lower = smoother across replans; 1.0 disables blending."
@@ -166,16 +166,41 @@ def _parse_args() -> argparse.Namespace:
         help="Max joint change (deg) per policy command (default: robot.max_relative_target in yaml).",
     )
     p.add_argument(
+        "--policy-ema-alpha",
+        type=float,
+        default=0.34,
+        help=(
+            "EMA on raw policy targets before VR shaping [0..1]. "
+            "Lower is smoother; 1.0 disables."
+        ),
+    )
+    p.add_argument(
         "--command-ema-alpha",
         type=float,
         default=0.22,
-        help="EMA smoothing for final command [0..1]. Lower is smoother, higher is snappier.",
+        help=(
+            "EMA smoothing for final command [0..1]. Lower is smoother, higher is snappier. "
+            "Too low (~0.14) can stall at home; too high (~0.28) reaches targets but jitters."
+        ),
     )
     p.add_argument(
         "--joint-deadband-deg",
         type=float,
-        default=0.8,
-        help="Suppress command updates smaller than this vs the previous filtered command (deg).",
+        default=0.75,
+        help=(
+            "Suppress command updates smaller than this vs the previous filtered command (deg). "
+            "Too high (~1.0) can stall at home; too low (~0.6) is snappy but jittery."
+        ),
+    )
+    p.add_argument(
+        "--clamp-to-present",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Clamp each command vs measured joint pose (robot.max_relative_target). "
+            "Default off: training labels are rate-limited vs the previous command, not "
+            "present; present clamp often causes oscillation during policy chunks."
+        ),
     )
     p.add_argument(
         "--dry-run",
@@ -568,7 +593,11 @@ def main() -> None:
     max_rel = args.max_relative_target
     if max_rel is None:
         max_rel = robot_cfg_yaml.get("max_relative_target")
-    print(f"  Max joint step    : {max_rel if max_rel is not None else 'disabled'} deg")
+    print(
+        f"  Clamp to present  : {args.clamp_to_present}"
+        + (f" (max {max_rel} deg)" if args.clamp_to_present and max_rel is not None else "")
+    )
+    print(f"  Policy EMA alpha  : {args.policy_ema_alpha}")
     print(f"  Command EMA alpha : {args.command_ema_alpha}")
     print(f"  Joint deadband    : {args.joint_deadband_deg} deg")
     print("=" * 60)
@@ -620,6 +649,7 @@ def main() -> None:
     print(f"  VR-style cmd shape : kp={vr_kp} per-tick caps (matches dataset action labels)")
     last_sent: dict[str, float] = {}
     last_filtered: dict[str, float] = {}
+    last_policy_smoothed: dict[str, float] = {}
     try:
         if home_pose and not args.home_before_episode:
             go_to_home_pose(
@@ -645,6 +675,7 @@ def main() -> None:
             postprocessor.reset()
             last_sent.clear()
             last_filtered.clear()
+            last_policy_smoothed.clear()
             policy.config.n_action_steps = min(
                 int(args.open_loop_steps),
                 int(policy.config.chunk_size),
@@ -678,6 +709,7 @@ def main() -> None:
                     postprocessor.reset()
                     last_sent.clear()
                     last_filtered.clear()
+                    last_policy_smoothed.clear()
 
                 obs_frame = _build_observation(raw_obs, JOINT_ORDER)
                 task_prompt = _task_for_step(
@@ -695,6 +727,12 @@ def main() -> None:
                     robot_type=robot.name,
                 )
                 action_dict = _actions_to_robot_dict(action, policy_joint_names)
+                if args.policy_ema_alpha < 0.999:
+                    policy_ref = last_policy_smoothed if last_policy_smoothed else action_dict
+                    action_dict = _ema_command(
+                        action_dict, policy_ref, float(args.policy_ema_alpha)
+                    )
+                    last_policy_smoothed = dict(action_dict)
                 if queue_empty_before and last_filtered and args.replan_blend < 0.999:
                     action_dict = _blend_action_dict(
                         action_dict, last_filtered, float(args.replan_blend)
@@ -706,9 +744,12 @@ def main() -> None:
                     kp=vr_kp,
                 )
                 final_cmd = shaped
-                max_rel_cfg = getattr(robot.config, "max_relative_target", None)
-                if max_rel_cfg is not None:
-                    final_cmd = _clamp_max_relative(shaped, present_dict, float(max_rel_cfg))
+                if args.clamp_to_present:
+                    max_rel_cfg = getattr(robot.config, "max_relative_target", None)
+                    if max_rel_cfg is not None:
+                        final_cmd = _clamp_max_relative(
+                            shaped, present_dict, float(max_rel_cfg)
+                        )
                 final_cmd = _apply_joint_deadband(
                     final_cmd, last_filtered, float(args.joint_deadband_deg)
                 )
@@ -729,15 +770,21 @@ def main() -> None:
                         f"  First step |shaped-present| max={np.abs(shaped_delta).max():.2f} deg "
                         f"(after VR shaping only)"
                     )
+                    sent_note = (
+                        "after present clamp"
+                        if args.clamp_to_present
+                        else "after EMA/deadband (VR caps only)"
+                    )
                     print(
                         f"  First step |sent-present|   max={np.abs(final_delta).max():.2f} deg "
-                        f"(final command after max_relative_target)"
+                        f"(final command {sent_note})"
                     )
                     for name, delta in _top_joint_deltas(final_cmd, present_dict):
                         print(f"    sent delta {name}: {delta:+.2f} deg")
                     logged_action_debug = True
 
-                _send_positions(robot, final_cmd, present=present_dict)
+                send_present = present_dict if args.clamp_to_present else None
+                _send_positions(robot, final_cmd, present=send_present)
                 last_sent = dict(final_cmd)
                 last_filtered = dict(final_cmd)
 

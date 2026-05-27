@@ -72,10 +72,60 @@ def _parse_args() -> argparse.Namespace:
         help="JSON mapping from dataset observation keys to policy expected keys.",
     )
     p.add_argument("--dry-run", action="store_true", help="Print command without executing.")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from an existing checkpoint (uses --output-dir/checkpoints/last by default).",
+    )
+    p.add_argument(
+        "--resume-from",
+        default="",
+        help=(
+            "Optional resume source path. Can be a run dir (with checkpoints/), "
+            "a checkpoint dir (.../checkpoints/020000), or a train_config.json path."
+        ),
+    )
     return p.parse_args()
 
 
-def _build_cmd(args: argparse.Namespace) -> list[str]:
+def _resolve_resume_config_path(args: argparse.Namespace) -> pathlib.Path:
+    candidates: list[pathlib.Path] = []
+    if args.resume_from:
+        src = pathlib.Path(args.resume_from).expanduser().resolve()
+        if src.is_file():
+            candidates.append(src)
+        else:
+            candidates.append(src / "train_config.json")
+            candidates.append(src / "pretrained_model" / "train_config.json")
+            candidates.append(src / "checkpoints" / "last" / "pretrained_model" / "train_config.json")
+    else:
+        out = pathlib.Path(args.output_dir).expanduser().resolve()
+        candidates.append(out / "checkpoints" / "last" / "pretrained_model" / "train_config.json")
+
+    for p in candidates:
+        if p.is_file():
+            return p
+
+    tried = "\n  - ".join(str(p) for p in candidates)
+    sys.exit(
+        "Could not find resume train_config.json. Tried:\n"
+        f"  - {tried}\n"
+        "Pass --resume-from with a valid checkpoint/run path."
+    )
+
+
+def _build_cmd(args: argparse.Namespace) -> tuple[list[str], pathlib.Path | None]:
+    if args.resume:
+        config_path = _resolve_resume_config_path(args)
+        cmd = [
+            "uv",
+            "run",
+            "lerobot-train",
+            f"--config_path={config_path}",
+            "--resume=true",
+        ]
+        return cmd, config_path
+
     try:
         rename_map = json.loads(args.rename_map_json)
     except json.JSONDecodeError as e:
@@ -118,14 +168,16 @@ def _build_cmd(args: argparse.Namespace) -> list[str]:
         cmd.append("--policy.push_to_hub=true")
         if args.policy_repo_id:
             cmd.append(f"--policy.repo_id={args.policy_repo_id}")
-    return cmd
+    return cmd, None
 
 
 def main() -> None:
     args = _parse_args()
-    cmd = _build_cmd(args)
+    cmd, resume_cfg = _build_cmd(args)
     print("Running:\n  " + " \\\n  ".join(shlex.quote(x) for x in cmd))
-    if args.oom_safe:
+    if args.resume and resume_cfg is not None:
+        print(f"Resume mode enabled from: {resume_cfg}")
+    elif args.oom_safe:
         print("OOM-safe mode enabled: batch_size capped at 2, vision encoder frozen, expert-only training enabled.")
     if args.dry_run:
         return
