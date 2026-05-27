@@ -1066,6 +1066,7 @@ class VRTeleopSession:
         # Resolved (absolute, ~-expanded) dataset storage root from most recent
         # recorder init. Shown on the UI's Recording card.
         self._last_dataset_root: str = ""
+        self._recording_repo_id: Optional[str] = None
 
         # Kinematics — analytical only; URDF IK has null-space jitter on the
         # redundant 5-DOF arm. URDF FK was used at RESET; analytical FK is now
@@ -1076,6 +1077,26 @@ class VRTeleopSession:
         # so the user doesn't have to re-run the wizard every session. New
         # calibrations overwrite the file via `_finalize_calibration`.
         self._load_persisted_calibrations()
+        # Populate UI recording counters from existing dataset (if present)
+        # before the first "Start recording" click.
+        self._bootstrap_recording_status_from_disk()
+
+    def _bootstrap_recording_status_from_disk(self) -> None:
+        """Load existing dataset episode summary for UI status on startup."""
+        try:
+            cfg = _dataset.load_dataset_config()
+            repo_id = str(cfg["repo_id"])
+            configured_root = cfg.get("root")
+            resolved_root = _dataset.resolve_root(configured_root, repo_id)
+            idx, frames = _dataset.last_episode_summary(repo_id=repo_id, root=configured_root)
+            self._recording_repo_id = repo_id
+            self._last_dataset_root = resolved_root
+            self._last_saved_episode_index = idx
+            self._last_saved_episode_frames = frames
+            self._episodes_saved = (idx + 1) if idx is not None else 0
+        except Exception as e:
+            # Keep status operational even if dataset metadata is absent/corrupt.
+            log.info("recording bootstrap skipped: %s", e)
 
     def _load_persisted_calibrations(self) -> None:
         """Restore per-arm session_vr_to_robot from disk. Silent no-op if no
@@ -1495,7 +1516,7 @@ class VRTeleopSession:
                 "last_episode_frames": (
                     rec.last_saved_episode_frames if rec else self._last_saved_episode_frames
                 ),
-                "repo_id": rec.repo_id if rec else None,
+                "repo_id": rec.repo_id if rec else self._recording_repo_id,
                 "last_task": self._last_task,
                 "root": shown_root,
             }
@@ -2963,6 +2984,7 @@ class VRTeleopSession:
                         self._last_dataset_root = _dataset.resolve_root(
                             effective_root, str(cfg["repo_id"]),
                         )
+                        self._recording_repo_id = str(cfg["repo_id"])
                         self._recorder = _dataset.DatasetRecorder(
                             repo_id=str(cfg["repo_id"]),
                             fps=int(cfg["fps"]),
