@@ -270,3 +270,9 @@ def api_vr_recording_task():
     if "task" not in body:
         abort(400, "task required")
     return jsonify(vr_mod.SESSION.set_recording_task(str(body.get("task") or "")))
+
+
+@bp.post("/api/vr/recording/delete_last")
+def api_vr_recording_delete_last():
+    """Delete the most recently saved recording episode."""
+    return jsonify(vr_mod.SESSION.delete_last_recorded_episode())

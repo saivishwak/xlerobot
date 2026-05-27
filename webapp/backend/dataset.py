@@ -19,8 +19,11 @@ existing single-frame producer architecture untouched.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import pathlib
+import shutil
 import threading
 import time
 from typing import Any, Optional
@@ -69,6 +72,8 @@ class DatasetRecorder:
         self._episode_count = 0
         self._frame_count = 0
         self._current_task: str = ""
+        self._last_saved_episode_index: Optional[int] = None
+        self._last_saved_episode_frames: int = 0
 
         features = self._build_features(JOINT_ORDER, self.camera_roles, self.camera_shape)
         resolved_root = pathlib.Path(resolve_root(str(root) if root else None, repo_id))
@@ -82,24 +87,72 @@ class DatasetRecorder:
                 image_writer_threads=2,
             )
         else:
+            needs_create = True
             if resolved_root.exists():
                 if has_info and not has_episode_meta:
-                    raise RuntimeError(
-                        "existing dataset root is not finalized/readable "
-                        f"(missing meta/episodes parquet): {resolved_root}. "
-                        "Move that directory aside or choose a new recording root."
-                    )
-                raise RuntimeError(f"dataset root exists but is not a LeRobot dataset: {resolved_root}")
-            self._dataset = LeRobotDataset.create(
-                repo_id=repo_id,
-                fps=self.fps,
-                features=features,
-                root=str(resolved_root),
-                robot_type="xlerobot-bimanual-so101",
-                use_videos=True,                     # MP4-encode image streams
-                image_writer_threads=2,              # async JPEG → video encode
-            )
+                    info_path = resolved_root / "meta" / "info.json"
+                    try:
+                        info = json.loads(info_path.read_text())
+                    except Exception as e:
+                        raise RuntimeError(
+                            "existing dataset root is not finalized/readable "
+                            f"(missing meta/episodes parquet and unreadable info.json): {resolved_root}. "
+                            "Move that directory aside or choose a new recording root."
+                        ) from e
+                    total_eps = int(info.get("total_episodes", -1))
+                    total_frames = int(info.get("total_frames", -1))
+                    if total_eps == 0 and total_frames == 0:
+                        # Valid empty dataset after deleting the last episode:
+                        # rebuild a clean writable root from info.json.
+                        backup = resolved_root.parent / f".{resolved_root.name}.empty-backup-{int(time.time()*1000)}"
+                        os.replace(resolved_root, backup)
+                        try:
+                            self._dataset = LeRobotDataset.create(
+                                repo_id=repo_id,
+                                fps=int(info["fps"]),
+                                features=info["features"],
+                                root=str(resolved_root),
+                                robot_type=str(info.get("robot_type") or "xlerobot-bimanual-so101"),
+                                use_videos=any(
+                                    isinstance(v, dict) and v.get("dtype") == "video"
+                                    for v in (info.get("features") or {}).values()
+                                ),
+                                image_writer_threads=2,
+                            )
+                            self._dataset.finalize()
+                            shutil.rmtree(backup, ignore_errors=True)
+                            needs_create = False
+                        except Exception:
+                            if not resolved_root.exists() and backup.exists():
+                                os.replace(backup, resolved_root)
+                            raise
+                    else:
+                        raise RuntimeError(
+                            "existing dataset root is not finalized/readable "
+                            f"(missing meta/episodes parquet): {resolved_root}. "
+                            "Move that directory aside or choose a new recording root."
+                        )
+                else:
+                    raise RuntimeError(f"dataset root exists but is not a LeRobot dataset: {resolved_root}")
+            if needs_create:
+                self._dataset = LeRobotDataset.create(
+                    repo_id=repo_id,
+                    fps=self.fps,
+                    features=features,
+                    root=str(resolved_root),
+                    robot_type="xlerobot-bimanual-so101",
+                    use_videos=True,                     # MP4-encode image streams
+                    image_writer_threads=2,              # async JPEG → video encode
+                )
         self._episode_count = int(getattr(self._dataset.meta, "total_episodes", 0))
+        if self._episode_count > 0:
+            try:
+                last_ep = self._dataset.meta.episodes[self._episode_count - 1]
+                self._last_saved_episode_index = self._episode_count - 1
+                self._last_saved_episode_frames = int(last_ep.get("length", 0))
+            except Exception:
+                self._last_saved_episode_index = self._episode_count - 1
+                self._last_saved_episode_frames = 0
         log.info("dataset recorder ready: repo_id=%s fps=%d cameras=%s root=%s",
                  repo_id, self.fps, self.camera_roles, self._dataset.root)
 
@@ -145,6 +198,16 @@ class DatasetRecorder:
         with self._lock:
             return self._frame_count
 
+    @property
+    def last_saved_episode_index(self) -> Optional[int]:
+        with self._lock:
+            return self._last_saved_episode_index
+
+    @property
+    def last_saved_episode_frames(self) -> int:
+        with self._lock:
+            return self._last_saved_episode_frames
+
     def start_episode(self, task: str = "") -> None:
         with self._lock:
             if self._in_episode:
@@ -178,6 +241,8 @@ class DatasetRecorder:
             self._dataset.save_episode()
             with self._lock:
                 self._episode_count = episode_count
+                self._last_saved_episode_index = episode_count - 1
+                self._last_saved_episode_frames = frame_count
             log.info("episode %d saved (%d frames)",
                      episode_count, frame_count)
             return True
@@ -352,3 +417,103 @@ def role_camera_list() -> tuple[list[str], tuple[int, int, int]]:
             roles.append(c.role)
     shape = (int(cfg["camera_height"]), int(cfg["camera_width"]), 3)
     return roles, shape
+
+
+def delete_last_episode(repo_id: str, root: Optional[str]) -> tuple[int, str]:
+    """Delete the most recently saved episode in-place.
+
+    Returns:
+        (new_total_episodes, resolved_root_path)
+    """
+    from lerobot.datasets.dataset_tools import delete_episodes as _delete_episodes
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    resolved_root = pathlib.Path(resolve_root(root, repo_id))
+    if not (resolved_root / "meta" / "info.json").is_file():
+        raise RuntimeError(f"dataset not found at {resolved_root}")
+
+    dataset = LeRobotDataset(repo_id=repo_id, root=resolved_root)
+    total = int(dataset.meta.total_episodes)
+    if total <= 0:
+        raise RuntimeError("no saved episodes to delete")
+
+    stamp = int(time.time() * 1000)
+    backup_root = resolved_root.parent / f".{resolved_root.name}.backup-delete-{stamp}"
+    if backup_root.exists():
+        raise RuntimeError(f"backup path already exists: {backup_root}")
+
+    # Special case: deleting the sole episode should leave a valid empty dataset.
+    if total == 1:
+        os.replace(resolved_root, backup_root)
+        try:
+            ds_new = LeRobotDataset.create(
+                repo_id=repo_id,
+                fps=int(dataset.meta.fps),
+                features=dataset.meta.features,
+                root=str(resolved_root),
+                robot_type=str(dataset.meta.robot_type),
+                use_videos=bool(dataset.meta.video_keys),
+                image_writer_threads=2,
+            )
+            ds_new.finalize()
+            shutil.rmtree(backup_root, ignore_errors=True)
+            return 0, str(resolved_root)
+        except Exception:
+            if not resolved_root.exists() and backup_root.exists():
+                os.replace(backup_root, resolved_root)
+            raise
+
+    # General case: materialize edited dataset in a temp sibling, then atomically swap.
+    tmp_root = resolved_root.parent / f".{resolved_root.name}.tmp-delete-{stamp}"
+    if tmp_root.exists():
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+    _delete_episodes(
+        dataset,
+        [total - 1],
+        output_dir=tmp_root,
+        repo_id=repo_id,
+    )
+
+    os.replace(resolved_root, backup_root)
+    try:
+        os.replace(tmp_root, resolved_root)
+        # Guardrail: ensure info.json reflects the deletion before committing.
+        post = LeRobotDataset(repo_id=repo_id, root=resolved_root)
+        if int(post.meta.total_episodes) != (total - 1):
+            raise RuntimeError(
+                "delete verification failed: info.json total_episodes did not update "
+                f"(expected {total - 1}, got {post.meta.total_episodes})"
+            )
+        shutil.rmtree(backup_root, ignore_errors=True)
+    except Exception:
+        if not resolved_root.exists() and backup_root.exists():
+            os.replace(backup_root, resolved_root)
+        elif backup_root.exists():
+            # If swap succeeded but verification failed, restore original dataset.
+            shutil.rmtree(resolved_root, ignore_errors=True)
+            os.replace(backup_root, resolved_root)
+        raise
+    finally:
+        if tmp_root.exists():
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+    return total - 1, str(resolved_root)
+
+
+def last_episode_summary(repo_id: str, root: Optional[str]) -> tuple[Optional[int], int]:
+    """Return (last_episode_index, last_episode_frames) for a dataset root."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    resolved_root = pathlib.Path(resolve_root(root, repo_id))
+    if not (resolved_root / "meta" / "info.json").is_file():
+        return None, 0
+    dataset = LeRobotDataset(repo_id=repo_id, root=resolved_root)
+    total = int(dataset.meta.total_episodes)
+    if total <= 0:
+        return None, 0
+    try:
+        ep = dataset.meta.episodes[total - 1]
+        return total - 1, int(ep.get("length", 0))
+    except Exception:
+        return total - 1, 0

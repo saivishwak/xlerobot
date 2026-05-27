@@ -115,6 +115,8 @@ export interface VRStatus {
     active: boolean;
     episodes_saved: number;
     frames_in_current_episode: number;
+    last_episode_index: number | null;
+    last_episode_frames: number;
     repo_id: string | null;
     /** Most-recent task description (from UI or previous session). */
     last_task: string;
@@ -184,6 +186,11 @@ export const api = {
   vrSetRecordingTask: (task: string) =>
     req<VRStatus>("/api/vr/recording/task", {
       method: "POST", body: JSON.stringify({ task }),
+    }),
+  /** Delete the most recently saved episode from the active recording dataset. */
+  vrDeleteLastRecordingEpisode: () =>
+    req<VRStatus>("/api/vr/recording/delete_last", {
+      method: "POST", body: JSON.stringify({}),
     }),
   /** Begin a guided motion-based calibration for one arm. */
   vrCalibrateStart: (arm: ArmSide) =>

@@ -4,7 +4,6 @@ import threading
 from types import SimpleNamespace
 
 from flask import Flask
-
 from webapp.backend import api as api_mod
 from webapp.backend import vr_teleop as vr_mod
 
@@ -144,6 +143,7 @@ def test_recording_restart_waits_for_previous_stop_to_finish(monkeypatch):
     session = vr_mod.VRTeleopSession()
     old_rec = _FakeRecorder()
     new_rec = _FakeRecorder()
+    new_rec.episode_count = 1
     entered_end = threading.Event()
     allow_end = threading.Event()
     start_done = threading.Event()
@@ -252,4 +252,97 @@ def test_vr_button_release_is_forwarded_for_repeat_b_toggles():
         return [goal.buttons for goal in goals]
 
     assert asyncio.run(run()) == [{"B": True}, {"B": False}, {"B": True}]
+
+
+def test_delete_last_recorded_episode_requires_stop():
+    session = vr_mod.VRTeleopSession()
+    session._recording = True
+
+    out = session.delete_last_recorded_episode()
+
+    assert out["recording"] is True
+    assert "stop recording" in (out["last_error"] or "")
+
+
+def test_delete_last_recorded_episode_updates_counters(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    session._episodes_saved = 3
+    session._last_dataset_root = "/tmp/old-root"
+
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "load_dataset_config",
+        lambda: {"repo_id": "test/repo", "root": None},
+    )
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "delete_last_episode",
+        lambda repo_id, root: (2, "/tmp/new-root"),
+    )
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "last_episode_summary",
+        lambda repo_id, root: (1, 420),
+    )
+
+    out = session.delete_last_recorded_episode()
+
+    assert out["recording_info"]["episodes_saved"] == 2
+    assert out["recording_info"]["root"] == "/tmp/new-root"
+    assert out["recording_info"]["last_episode_index"] == 1
+    assert out["recording_info"]["last_episode_frames"] == 420
+    assert session._episodes_saved == 2
+    assert session._last_dataset_root == "/tmp/new-root"
+
+
+def test_delete_last_recorded_episode_api(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    monkeypatch.setattr(api_mod.vr_mod, "SESSION", session)
+    monkeypatch.setattr(
+        session,
+        "delete_last_recorded_episode",
+        lambda: {"ok": True, "recording": False},
+    )
+
+    app = Flask(__name__)
+    app.register_blueprint(api_mod.bp)
+    resp = app.test_client().post("/api/vr/recording/delete_last", json={})
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "recording": False}
+
+
+def test_start_recording_after_delete_keeps_saved_count(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    recorder = _FakeRecorder()
+    recorder.episode_count = 2
+    recorder.last_saved_episode_index = 1
+    recorder.last_saved_episode_frames = 420
+
+    session._episodes_saved = 2
+    session._recording = False
+    session._last_task = "Pick the red block"
+
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "load_dataset_config",
+        lambda: {
+            "home_before_episode": False,
+            "repo_id": "test/repo",
+            "fps": 30,
+            "push_to_hub": False,
+            "root": None,
+        },
+    )
+    monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
+    monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
+    monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: recorder)
+
+    assert session.set_recording(True, task="Pick the red block") is True
+    status = session.status()
+    assert status["recording_info"]["episodes_saved"] == 2
+    assert status["recording_info"]["last_episode_index"] == 1
+    assert status["recording_info"]["last_episode_frames"] == 420
+
+
 

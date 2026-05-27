@@ -8,7 +8,7 @@ import {
   IconAlertTriangleFilled, IconCopy, IconCheck, IconHandStop,
   IconHeadset, IconHome, IconHomeCog, IconLock, IconLockOpen,
   IconPlayerPlay, IconPlayerStop,
-  IconPlugConnected, IconPlugConnectedX,
+  IconPlugConnected, IconPlugConnectedX, IconTrash,
 } from "@tabler/icons-react";
 import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
@@ -871,13 +871,14 @@ function HomeCard({ side, armState, onCapture, onGoHome, onCancelHome,
  *  observation.state + cameras. The `task` string is stored on every frame
  *  and used as conditioning for VLA training. */
 function RecordingCard({ s, task, onTaskChange, storageRoot, onStorageRootChange,
-                          onToggle, busy }: {
+                          onToggle, onDeleteLast, busy }: {
   s: VRStatus | undefined;
   task: string;
   onTaskChange: (t: string) => void;
   storageRoot: string;
   onStorageRootChange: (path: string) => void;
   onToggle: (enabled: boolean) => void;
+  onDeleteLast: () => void;
   busy: boolean;
 }) {
   const recording = !!s?.recording;
@@ -920,6 +921,20 @@ function RecordingCard({ s, task, onTaskChange, storageRoot, onStorageRootChange
             {recording ? "Stop recording" : "Start recording"}
           </Button>
         </Group>
+        <Button
+          color="red"
+          variant="light"
+          leftSection={<IconTrash size={14} />}
+          onClick={onDeleteLast}
+          disabled={busy || recording || (info?.episodes_saved ?? 0) < 1}
+        >
+          Delete last episode
+        </Button>
+        <Text fz="xs" c="dimmed">
+          {(info?.last_episode_index ?? null) !== null
+            ? `Last saved: episode ${info?.last_episode_index} (${info?.last_episode_frames ?? 0} frames)`
+            : "No saved episodes yet."}
+        </Text>
 
         <TextInput
           label="Task description"
@@ -976,6 +991,7 @@ export function VRTeleop() {
   );
   const [busy, setBusy] = useState(false);
   const [eStopConfirm, setEStopConfirm] = useState(false);
+  const [deleteLastConfirm, setDeleteLastConfirm] = useState(false);
   // Per-episode task description. Sent to the recorder on every Start; LeRobot
   // v2 stores it on each frame and uses it as conditioning input for VLA training.
   const [taskDescription, setTaskDescription] = useState("");
@@ -1065,6 +1081,25 @@ export function VRTeleop() {
     } catch (e) {
       notifications.show({ color: "red", title: "Recording toggle failed",
                             message: String(e) });
+    }
+  };
+
+  const handleDeleteLastEpisode = async () => {
+    setDeleteLastConfirm(false);
+    try {
+      await api.vrDeleteLastRecordingEpisode();
+      notifications.show({
+        color: "yellow",
+        title: "Deleted last episode",
+        message: "The latest saved episode was removed. You can record it again.",
+      });
+      await mutate();
+    } catch (e) {
+      notifications.show({
+        color: "red",
+        title: "Delete failed",
+        message: String(e),
+      });
     }
   };
 
@@ -1214,6 +1249,7 @@ export function VRTeleop() {
                        storageRoot={storageRoot}
                        onStorageRootChange={setStorageRoot}
                        onToggle={handleRecordingToggle}
+                       onDeleteLast={() => setDeleteLastConfirm(true)}
                        busy={busy} />
 
         <Grid>
@@ -1271,6 +1307,27 @@ export function VRTeleop() {
           <Group justify="flex-end">
             <Button variant="default" onClick={() => setEStopConfirm(false)}>Cancel</Button>
             <Button color="red" onClick={handleEStop}>Stop now</Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal opened={deleteLastConfirm}
+             onClose={() => setDeleteLastConfirm(false)}
+             title="Delete last recorded episode?"
+             centered
+             size="sm">
+        <Stack>
+          <Alert color="yellow" icon={<IconAlertTriangleFilled />}>
+            This permanently removes the most recent saved episode.
+          </Alert>
+          <Text size="sm">
+            Episode index: <b>{s?.recording_info?.last_episode_index ?? "—"}</b>
+          </Text>
+          <Text size="sm">
+            Frame count: <b>{s?.recording_info?.last_episode_frames ?? 0}</b>
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setDeleteLastConfirm(false)}>Cancel</Button>
+            <Button color="red" onClick={handleDeleteLastEpisode}>Delete episode</Button>
           </Group>
         </Stack>
       </Modal>

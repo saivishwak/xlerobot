@@ -1057,6 +1057,8 @@ class VRTeleopSession:
         self._recorder: Optional[_dataset.DatasetRecorder] = None
         self._recording_transition_lock = threading.Lock()
         self._episodes_saved: int = 0
+        self._last_saved_episode_index: Optional[int] = None
+        self._last_saved_episode_frames: int = 0
         # Last task string synced from the UI. Cached here so the Quest B button
         # can start an episode with the task the user typed on the web page.
         # Empty text clears the cache and recording start is rejected.
@@ -1298,7 +1300,7 @@ class VRTeleopSession:
             except Exception as e: log.warning("e-stop: end_episode: %s", e)
             else:
                 with self._lock:
-                    self._episodes_saved = max(self._episodes_saved, rec.episode_count)
+                    self._episodes_saved = rec.episode_count
         if rec is not None:
             try: rec.finalize()
             except Exception as e: log.warning("e-stop: finalize: %s", e)
@@ -1485,8 +1487,14 @@ class VRTeleopSession:
                     shown_root = ""
             recording_info = {
                 "active": self._recording,
-                "episodes_saved": max(self._episodes_saved, rec.episode_count if rec else 0),
+                "episodes_saved": (rec.episode_count if rec else self._episodes_saved),
                 "frames_in_current_episode": rec.frame_count_in_episode if rec else 0,
+                "last_episode_index": (
+                    rec.last_saved_episode_index if rec else self._last_saved_episode_index
+                ),
+                "last_episode_frames": (
+                    rec.last_saved_episode_frames if rec else self._last_saved_episode_frames
+                ),
                 "repo_id": rec.repo_id if rec else None,
                 "last_task": self._last_task,
                 "root": shown_root,
@@ -2845,6 +2853,45 @@ class VRTeleopSession:
             self._last_task = (task or "").strip()
         return self.status()
 
+    def delete_last_recorded_episode(self) -> dict:
+        """Delete the most recently saved episode so operators can retry."""
+        with self._recording_transition_lock:
+            with self._lock:
+                if self._recording:
+                    self._last_error = "stop recording before deleting the last episode"
+                    return self.status()
+                rec = self._recorder
+                self._recorder = None
+            if rec is not None:
+                try:
+                    rec.finalize()
+                except Exception as e:
+                    log.warning("delete-last: finalize before delete failed: %s", e)
+            try:
+                cfg = _dataset.load_dataset_config()
+                effective_root = self._last_dataset_root or _dataset.resolve_root(
+                    cfg.get("root"),
+                    str(cfg["repo_id"]),
+                )
+                new_total, resolved_root = _dataset.delete_last_episode(
+                    repo_id=str(cfg["repo_id"]),
+                    root=effective_root,
+                )
+                with self._lock:
+                    self._episodes_saved = new_total
+                    self._last_dataset_root = resolved_root
+                    idx, frames = _dataset.last_episode_summary(
+                        repo_id=str(cfg["repo_id"]),
+                        root=resolved_root,
+                    )
+                    self._last_saved_episode_index = idx
+                    self._last_saved_episode_frames = frames
+                    self._last_error = None
+            except Exception as e:
+                with self._lock:
+                    self._last_error = f"delete last episode failed: {e}"
+            return self.status()
+
     def set_recording(self, enabled: bool, task: str = "",
                        home_first: Optional[bool] = None,
                        root: Optional[str] = None) -> bool:
@@ -2929,6 +2976,9 @@ class VRTeleopSession:
                         log.exception("could not start dataset recorder")
                         return self._recording
                 self._recorder.start_episode(task=effective_task)
+                self._episodes_saved = self._recorder.episode_count
+                self._last_saved_episode_index = getattr(self._recorder, "last_saved_episode_index", None)
+                self._last_saved_episode_frames = int(getattr(self._recorder, "last_saved_episode_frames", 0))
                 self._recording = True
             else:
                 # End the in-flight episode. Capture writes finish on the
@@ -2944,7 +2994,9 @@ class VRTeleopSession:
             # the viewer sees data/video files but no meta/episodes parquet.
             if saved:
                 with self._lock:
-                    self._episodes_saved = max(self._episodes_saved, rec.episode_count)
+                    self._episodes_saved = rec.episode_count
+                    self._last_saved_episode_index = getattr(rec, "last_saved_episode_index", None)
+                    self._last_saved_episode_frames = int(getattr(rec, "last_saved_episode_frames", 0))
                 rec.finalize()
                 with self._lock:
                     if self._recorder is rec:
